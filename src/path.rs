@@ -61,14 +61,12 @@ pub fn resolve(input: &[u8], out: &mut [u8; PATH_MAX]) -> usize {
 
     // Join cwd + "/" + input, then normalize.
     let mut joined = [0u8; PATH_MAX];
-    let mut jlen = 0usize;
-
     // Copy cwd.
     if cwd_len > PATH_MAX - 2 {
         return 0;
     }
     joined[..cwd_len].copy_from_slice(cwd);
-    jlen = cwd_len;
+    let mut jlen = cwd_len;
 
     // Add separator if cwd doesn't end with '/'.
     if jlen > 0 && joined[jlen - 1] != b'/' {

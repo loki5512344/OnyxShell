@@ -18,21 +18,10 @@
 //! root (ring 1). The default first-boot auto-login is root, so all
 //! commands work out of the box. Regular users (ring 2) will get
 //! `EPERM` from these commands.
-//!
-//! ## Compilation
-//!
-//! ```sh
-//! cargo build --release
-//! # Convert ELF → OnyxExec v2:
-//! elf2onx --compress target/riscv64gc-unknown-none-elf/release/onyx-osh osh.onx
-//! ```
-//!
-//! The resulting `osh.onx` is placed at `/bin/osh` in the OnyxFS
-//! disk image.
 
 #![no_std]
 #![no_main]
-#![allow(unsafe_op_in_unsafe_fn, non_snake_case, clippy::missing_safety_doc)]
+#![allow(unsafe_op_in_unsafe_fn, non_snake_case, clippy::missing_safety_doc, static_mut_refs)]
 
 use core::arch::asm;
 
@@ -42,7 +31,7 @@ mod path;
 mod syscalls;
 
 /// Shell version banner (printed on startup).
-const VERSION_BANNER: &str = "OnyxShell v0.2.0 (built-in commands)\n";
+const VERSION_BANNER: &str = "OnyxShell v0.3.0 (built-in commands)\n";
 
 /// Shell prompt. Printed before each line of input.
 const PROMPT: &str = "osh$ ";
@@ -50,33 +39,40 @@ const PROMPT: &str = "osh$ ";
 /// Maximum input line length.
 const LINE_MAX: usize = 256;
 
-/// Entry point — called by the kernel's OnyxExec loader.
+/// ── Static buffers ──────────────────────────────────────────────────────
+/// We use static mutable buffers instead of stack-allocated ones.
+/// This guarantees the buffers are in .bss (always mapped RW) and at
+/// valid user addresses, eliminating potential stack-related issues
+/// where user_ptr_ok() might reject a stack address.
 ///
-/// The kernel sets `a0 = argc` and `a1 = argv_ptr` before jumping here,
-/// but the shell ignores them (login execs `/bin/osh` with no args).
+/// Safety: There is only one shell process, so there are no reentrancy
+/// or aliasing concerns.
+static mut G_LINE: [u8; LINE_MAX] = [0u8; LINE_MAX];
+static mut G_TOKEN_OFFSETS: [(usize, usize); commands::MAX_ARGS] = [(0usize, 0usize); commands::MAX_ARGS];
+
+/// Entry point — called by the kernel's OnyxExec loader.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     // Print version banner.
     syscalls::write(1, VERSION_BANNER.as_ptr(), VERSION_BANNER.len());
 
     // Main read-eval-print loop.
-    let mut line = [0u8; LINE_MAX];
-    let mut token_offsets = [(0usize, 0usize); commands::MAX_ARGS];
-
     loop {
         // Print prompt.
         syscalls::write(1, PROMPT.as_ptr(), PROMPT.len());
 
         // Read a line from stdin. The kernel handles line editing
         // (echo, backspace) internally for fd 0.
-        let n = io::read_line(&mut line);
+        let n = io::read_line(unsafe { &mut G_LINE });
         if n == 0 {
+            // read_line returned 0 — either an error or empty line.
+            // Silently continue to the next prompt.
             continue;
         }
 
         // Strip trailing newline / carriage return / NUL.
         let mut end = n;
-        while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r' || line[end - 1] == 0) {
+        while end > 0 && (G_LINE[end - 1] == b'\n' || G_LINE[end - 1] == b'\r' || G_LINE[end - 1] == 0) {
             end -= 1;
         }
 
@@ -85,23 +81,26 @@ pub unsafe extern "C" fn _start() -> ! {
             continue;
         }
 
-        let raw = &line[..end];
+        let raw = unsafe { &G_LINE[..end] };
 
         // Tokenize into arguments.
-        let ntok = io::tokenize(raw, &mut token_offsets);
+        let ntok = io::tokenize(raw, unsafe { &mut G_TOKEN_OFFSETS });
         if ntok == 0 {
             continue;
         }
 
         // Build a slice of argument slices for the dispatcher.
-        let mut args: [&[u8]; commands::MAX_ARGS] = [&[]; commands::MAX_ARGS];
-        for i in 0..ntok {
-            let (off, len) = token_offsets[i];
-            args[i] = &raw[off..off + len];
+        // We use a static array to avoid stack allocation.
+        static mut G_ARGS: [&[u8]; commands::MAX_ARGS] = [&[]; commands::MAX_ARGS];
+        unsafe {
+            for i in 0..ntok {
+                let (off, len) = G_TOKEN_OFFSETS[i];
+                G_ARGS[i] = &raw[off..off + len];
+            }
         }
 
         // Dispatch to the command handler.
-        commands::dispatch(&args[..ntok]);
+        commands::dispatch(unsafe { &G_ARGS[..ntok] });
     }
 }
 

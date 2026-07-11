@@ -15,13 +15,21 @@ SECTIONS {
         *(.rodata .srodata .rodata.* .srodata.*)
     }
 
+    /* Page-align .data so it does NOT share a page with .rodata.
+       OnyxKernel maps each LOAD segment with its own permissions.
+       If .data and .rodata land on the same page, the kernel maps
+       the page as read-only (from .rodata) and the first write to
+       .data page-faults. Page-aligning ensures .data gets its own
+       page mapped read-write. */
+    . = ALIGN(0x1000);
     .data : ALIGN(8) {
         *(.data .sdata .data.* .sdata.*)
     }
+    . = ALIGN(8);
 
-    /* Page-align .bss so it does not share a page with .rodata.
+    /* Page-align .bss so it does not share a page with .data.
        OnyxKernel maps pages with specific permissions; if .bss and
-       .rodata land on the same page, the first write to .bss will
+       .data land on the same page, the first write to .bss will
        page-fault because the page was mapped read-only.
        (From patch 04-linker-bss-page-align.patch.) */
     . = ALIGN(0x1000);

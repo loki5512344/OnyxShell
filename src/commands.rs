@@ -289,12 +289,11 @@ fn ls_long(dir_path: &[u8]) {
 
 /// Join a directory path and a name into `out`, NUL-terminated.
 fn join_path(dir: &[u8], name: &[u8], out: &mut [u8; path::PATH_MAX]) -> usize {
-    let mut olen = 0usize;
     if dir.len() >= path::PATH_MAX {
         return 0;
     }
     out[..dir.len()].copy_from_slice(dir);
-    olen = dir.len();
+    let mut olen = dir.len();
     // Add separator if dir doesn't end with '/'.
     if olen > 0 && out[olen - 1] != b'/' {
         if olen >= path::PATH_MAX - 1 {
