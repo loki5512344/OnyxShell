@@ -1,0 +1,10 @@
+[build]
+# Default target — OnyxOS is RISC-V 64-bit only.
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=--gc-sections",
+    "-C", "force-frame-pointers=no",
+    "-C", "code-model=medium",
+]

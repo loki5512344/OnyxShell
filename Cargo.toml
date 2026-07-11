@@ -1,0 +1,24 @@
+[package]
+name = "onyx-osh"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+authors = ["loki5512344"]
+description = "OnyxShell — user-space shell for OnyxOS with built-in ls, cat, rm, cd, cp, mv, mkdir, and more"
+
+[[bin]]
+name = "onyx-osh"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = false
+codegen-units = 1
+opt-level = 0
+debug = true
+overflow-checks = false

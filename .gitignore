@@ -1,0 +1,5 @@
+/target/
+/build/onyx-osh
+*.o
+*.a
+*.elf
