@@ -135,11 +135,7 @@ fn cmd_pwd(_args: &[&[u8]]) {
 // ─── cd ──────────────────────────────────────────────────────────────────
 
 fn cmd_cd(args: &[&[u8]]) {
-    let target: &[u8] = if args.is_empty() {
-        b"/"
-    } else {
-        args[0]
-    };
+    let target: &[u8] = if args.is_empty() { b"/" } else { args[0] };
 
     let mut abs = [0u8; path::PATH_MAX];
     let len = path::resolve(target, &mut abs);
@@ -175,11 +171,7 @@ fn cmd_ls(args: &[&[u8]]) {
     }
 
     let mut abs = [0u8; path::PATH_MAX];
-    let target = if path_arg.is_empty() {
-        b"."
-    } else {
-        path_arg
-    };
+    let target = if path_arg.is_empty() { b"." } else { path_arg };
     let len = path::resolve(target, &mut abs);
     if len == 0 {
         io::write_error("ls: path too long");
@@ -202,9 +194,8 @@ fn ls_short(dir_path: &[u8]) {
     let mut name = [0u8; 256];
     let mut any = false;
     loop {
-        let ret = unsafe {
-            syscalls::readdir(path_buf.as_ptr(), name.as_mut_ptr(), name.len() as u64)
-        };
+        let ret =
+            unsafe { syscalls::readdir(path_buf.as_ptr(), name.as_mut_ptr(), name.len() as u64) };
         if ret <= 0 {
             if ret < 0 && !any {
                 io::write_error_errno("ls", ret);
@@ -231,9 +222,8 @@ fn ls_long(dir_path: &[u8]) {
     let mut name = [0u8; 256];
     let mut any = false;
     loop {
-        let ret = unsafe {
-            syscalls::readdir(path_buf.as_ptr(), name.as_mut_ptr(), name.len() as u64)
-        };
+        let ret =
+            unsafe { syscalls::readdir(path_buf.as_ptr(), name.as_mut_ptr(), name.len() as u64) };
         if ret <= 0 {
             if ret < 0 && !any {
                 io::write_error_errno("ls", ret);
@@ -271,12 +261,9 @@ fn ls_long(dir_path: &[u8]) {
         // struct stat layout (see kernel UserStat):
         //   st_mode: u32 at offset 16
         //   st_size: i64 at offset 48
-        let st_mode = u32::from_le_bytes([
-            st[16], st[17], st[18], st[19],
-        ]);
+        let st_mode = u32::from_le_bytes([st[16], st[17], st[18], st[19]]);
         let st_size = i64::from_le_bytes([
-            st[48], st[49], st[50], st[51],
-            st[52], st[53], st[54], st[55],
+            st[48], st[49], st[50], st[51], st[52], st[53], st[54], st[55],
         ]);
 
         // Determine type from st_mode's S_IFMT bits.
@@ -310,11 +297,15 @@ fn join_path(dir: &[u8], name: &[u8], out: &mut [u8; path::PATH_MAX]) -> usize {
     olen = dir.len();
     // Add separator if dir doesn't end with '/'.
     if olen > 0 && out[olen - 1] != b'/' {
-        if olen >= path::PATH_MAX - 1 { return 0; }
+        if olen >= path::PATH_MAX - 1 {
+            return 0;
+        }
         out[olen] = b'/';
         olen += 1;
     }
-    if olen + name.len() >= path::PATH_MAX { return 0; }
+    if olen + name.len() >= path::PATH_MAX {
+        return 0;
+    }
     out[olen..olen + name.len()].copy_from_slice(name);
     olen += name.len();
     out[olen] = 0;
@@ -351,7 +342,9 @@ fn cmd_cat(args: &[&[u8]]) {
             }
             io::write_raw(&buf[..n as usize]);
         }
-        unsafe { syscalls::close(fd as u64); }
+        let _ = unsafe {
+            syscalls::close(fd as u64);
+        };
     }
 }
 
@@ -441,7 +434,9 @@ fn cmd_cp(args: &[&[u8]]) {
     let dst_fd = unsafe { syscalls::create(dst_abs.as_ptr(), 0, 0) };
     if dst_fd < 0 {
         io::write_error_errno("cp: cannot create destination", dst_fd);
-        unsafe { syscalls::close(src_fd as u64); }
+        unsafe {
+            syscalls::close(src_fd as u64);
+        }
         return;
     }
 
@@ -465,9 +460,7 @@ fn copy_loop(src_fd: u64, dst_fd: u64) {
         let n = n as usize;
         let mut written = 0usize;
         while written < n {
-            let w = unsafe {
-                syscalls::write_fd(dst_fd, buf[written..].as_ptr(), n - written)
-            };
+            let w = unsafe { syscalls::write_fd(dst_fd, buf[written..].as_ptr(), n - written) };
             if w <= 0 {
                 io::write_error("cp: write error");
                 return;
@@ -534,7 +527,9 @@ fn cmd_touch(args: &[&[u8]]) {
         // returns EEXIST and we just close the existing fd (no error).
         let ret = unsafe { syscalls::create(abs.as_ptr(), 0, 0) };
         if ret >= 0 {
-            unsafe { syscalls::close(ret as u64); }
+            unsafe {
+                syscalls::close(ret as u64);
+            }
         } else if ret != syscalls::EEXIST {
             io::write_error_errno("touch", ret);
         }
@@ -572,11 +567,21 @@ fn cmd_stat(args: &[&[u8]]) {
     let st_uid = u32::from_le_bytes([st[24], st[25], st[26], st[27]]);
     let st_gid = u32::from_le_bytes([st[28], st[29], st[30], st[31]]);
     // st_rdev at offset 40 (after 4 bytes padding at 36)
-    let st_rdev = u64::from_le_bytes([st[40], st[41], st[42], st[43], st[44], st[45], st[46], st[47]]);
-    let st_size = i64::from_le_bytes([st[48], st[49], st[50], st[51], st[52], st[53], st[54], st[55]]);
-    let st_blksize = i64::from_le_bytes([st[56], st[57], st[58], st[59], st[60], st[61], st[62], st[63]]);
-    let st_blocks = i64::from_le_bytes([st[64], st[65], st[66], st[67], st[68], st[69], st[70], st[71]]);
-    let st_mtime = i64::from_le_bytes([st[88], st[89], st[90], st[91], st[92], st[93], st[94], st[95]]);
+    let st_rdev = u64::from_le_bytes([
+        st[40], st[41], st[42], st[43], st[44], st[45], st[46], st[47],
+    ]);
+    let st_size = i64::from_le_bytes([
+        st[48], st[49], st[50], st[51], st[52], st[53], st[54], st[55],
+    ]);
+    let st_blksize = i64::from_le_bytes([
+        st[56], st[57], st[58], st[59], st[60], st[61], st[62], st[63],
+    ]);
+    let st_blocks = i64::from_le_bytes([
+        st[64], st[65], st[66], st[67], st[68], st[69], st[70], st[71],
+    ]);
+    let st_mtime = i64::from_le_bytes([
+        st[88], st[89], st[90], st[91], st[92], st[93], st[94], st[95],
+    ]);
 
     // Determine file type from st_mode.
     let ifmt = st_mode & 0o170_000;
@@ -640,11 +645,7 @@ fn cmd_whoami(_args: &[&[u8]]) {
     let uid = unsafe { syscalls::getuid() };
     let ring = unsafe { syscalls::getring() };
 
-    let user_str: &[u8] = if uid == 0 {
-        b"root"
-    } else {
-        b"user"
-    };
+    let user_str: &[u8] = if uid == 0 { b"root" } else { b"user" };
     let ring_str: &[u8] = match ring {
         0 => b"kernel",
         1 => b"root",
@@ -720,7 +721,9 @@ fn cmd_clear(_args: &[&[u8]]) {
 
 fn cmd_exit(_args: &[&[u8]]) {
     io::write_line("logout");
-    unsafe { syscalls::exit(0); }
+    unsafe {
+        syscalls::exit(0);
+    }
 }
 
 // ─── ver ─────────────────────────────────────────────────────────────────

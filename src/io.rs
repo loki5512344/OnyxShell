@@ -21,7 +21,7 @@ pub fn write_str(s: &str) {
 #[inline]
 pub fn write_byte(b: u8) {
     unsafe {
-        let buf: [u8; 2] = [b, 0];
+        let buf = [b];
         syscalls::write(1, buf.as_ptr(), 1);
     }
 }
@@ -104,7 +104,9 @@ pub fn write_hex(n: u64) {
 /// Print a number in a fixed-width field (right-aligned with spaces).
 pub fn write_u64_field(n: u64, width: usize) {
     if n == 0 {
-        for _ in 0..(width - 1) { write_byte(b' '); }
+        for _ in 0..(width - 1) {
+            write_byte(b' ');
+        }
         write_byte(b'0');
         return;
     }
@@ -118,7 +120,9 @@ pub fn write_u64_field(n: u64, width: usize) {
     }
     let digits = buf.len() - i;
     if digits < width {
-        for _ in 0..(width - digits) { write_byte(b' '); }
+        for _ in 0..(width - digits) {
+            write_byte(b' ');
+        }
     }
     write_raw(&buf[i..]);
 }
