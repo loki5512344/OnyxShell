@@ -28,6 +28,7 @@ use core::arch::asm;
 mod commands;
 mod io;
 mod path;
+mod pipeline;
 mod syscalls;
 
 /// Shell version banner (printed on startup).
@@ -82,6 +83,16 @@ pub unsafe extern "C" fn _start() -> ! {
         }
 
         let raw = unsafe { &G_LINE[..end] };
+
+        // Check if the line contains a pipe `|` or redirect `>` / `<`.
+        // If so, parse and execute via the pipeline module. Otherwise
+        // fall back to the simple single-command dispatch path.
+        let has_pipe_or_redirect = raw.iter().any(|&b| b == b'|' || b == b'>' || b == b'<');
+        if has_pipe_or_redirect {
+            let p = pipeline::parse(raw);
+            unsafe { pipeline::execute(raw, &p); }
+            continue;
+        }
 
         // Tokenize into arguments.
         let ntok = io::tokenize(raw, unsafe { &mut G_TOKEN_OFFSETS });

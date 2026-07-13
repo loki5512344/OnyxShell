@@ -53,6 +53,10 @@ pub const SYS_getdents64: u64 = 52;
 pub const SYS_execve: u64    = 58;
 pub const SYS_clock_gettime: u64 = 64;
 pub const SYS_isatty: u64    = 66;
+pub const SYS_pipe: u64      = 36;
+pub const SYS_dup: u64       = 35;
+pub const SYS_fork: u64      = 63;
+pub const SYS_getdents: u64  = 77;
 
 // ── open() flags (Linux-compatible) ──────────────────────────────────────
 pub const O_RDONLY: u32  = 0;
@@ -225,6 +229,45 @@ pub unsafe fn close(fd: u64) -> i64 {
         "ecall",
         in("a7") SYS_close,
         in("a0") fd,
+        lateout("a0") ret,
+    );
+    ret
+}
+
+/// pipe(out_fds) → 0 on success. Fills `out_fds[0]` = read end,
+/// `out_fds[1]` = write end. Both fds are token-style (u64).
+#[inline]
+pub unsafe fn pipe(out_fds: *mut u64) -> i64 {
+    let ret: i64;
+    asm!(
+        "ecall",
+        in("a7") SYS_pipe,
+        in("a0") out_fds as usize,
+        lateout("a0") ret,
+    );
+    ret
+}
+
+/// dup(fd) → new fd token (≥0) or negative errno.
+#[inline]
+pub unsafe fn dup(fd: u64) -> i64 {
+    let ret: i64;
+    asm!(
+        "ecall",
+        in("a7") SYS_dup,
+        in("a0") fd,
+        lateout("a0") ret,
+    );
+    ret
+}
+
+/// fork() → child PID to parent, 0 to child, or negative errno.
+#[inline]
+pub unsafe fn fork() -> i64 {
+    let ret: i64;
+    asm!(
+        "ecall",
+        in("a7") SYS_fork,
         lateout("a0") ret,
     );
     ret
