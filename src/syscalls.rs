@@ -57,6 +57,12 @@ pub const SYS_pipe: u64      = 36;
 pub const SYS_dup: u64       = 35;
 pub const SYS_fork: u64      = 63;
 pub const SYS_getdents: u64  = 77;
+pub const SYS_ioctl: u64     = 53;
+
+// ── ioctl requests (OnyxOS extensions for raw terminal mode) ────────────
+pub const TIOCSRAW: u64   = 0x5421;  // enable raw mode for fd 0
+pub const TIOCRRAW: u64   = 0x5422;  // disable raw mode
+pub const TIOCGRAW: u64   = 0x5423;  // query raw mode (returns 1/0)
 
 // ── open() flags (Linux-compatible) ──────────────────────────────────────
 pub const O_RDONLY: u32  = 0;
@@ -554,4 +560,32 @@ pub unsafe fn getdents64(fd: u64, buf: *mut u8, count: u64) -> i64 {
         lateout("a0") ret,
     );
     ret
+}
+
+/// ioctl(fd, request, arg) → 0 on success or negative errno.
+#[inline]
+pub unsafe fn ioctl(fd: u64, request: u64, arg: u64) -> i64 {
+    let ret: i64;
+    asm!(
+        "ecall",
+        in("a7") SYS_ioctl,
+        in("a0") fd,
+        in("a1") request,
+        in("a2") arg,
+        lateout("a0") ret,
+    );
+    ret
+}
+
+/// Enable raw terminal mode for stdin (fd 0). After this, sys_read(0, ...)
+/// returns raw bytes without echo or line editing.
+#[inline]
+pub unsafe fn enable_raw_mode() -> i64 {
+    ioctl(0, TIOCSRAW, 0)
+}
+
+/// Disable raw terminal mode (restore cooked/line-edited input).
+#[inline]
+pub unsafe fn disable_raw_mode() -> i64 {
+    ioctl(0, TIOCRRAW, 0)
 }

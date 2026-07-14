@@ -92,6 +92,60 @@ pub unsafe fn history_last() -> Option<&'static [u8]> {
     Some(&G_HISTORY[slot][..len])
 }
 
+// ── Arrow-key history navigation ───────────────────────────────────────
+//
+// The shell maintains a "cursor" into the history. When the user presses
+// Up, the cursor moves to the previous entry; Down moves to the next.
+// The cursor is separate from G_HISTORY_COUNT (which tracks total entries)
+// so that navigating doesn't perturb the push order.
+
+static mut G_NAV_CURSOR: isize = -1; // -1 = "current line", 0..N = history index from newest
+
+/// Reset the navigation cursor (call when a new line starts).
+pub unsafe fn nav_reset() {
+    G_NAV_CURSOR = -1;
+}
+
+/// Navigate history up (older). Returns the entry to display, or None
+/// if we're already at the oldest entry.
+pub unsafe fn nav_up() -> Option<&'static [u8]> {
+    if G_HISTORY_COUNT == 0 {
+        return None;
+    }
+    let stored = G_HISTORY_COUNT.min(HISTORY_SIZE) as isize;
+    // G_NAV_CURSOR == -1 means "current line" (not in history).
+    // 0 means newest entry, stored-1 means oldest.
+    let new_cursor = if G_NAV_CURSOR == -1 {
+        0 // start at newest
+    } else {
+        G_NAV_CURSOR + 1
+    };
+    if new_cursor >= stored {
+        return None; // already at oldest
+    }
+    G_NAV_CURSOR = new_cursor;
+    // Convert cursor (0=newest) to slot index.
+    let logical = G_HISTORY_COUNT - 1 - new_cursor as usize;
+    let slot = logical % HISTORY_SIZE;
+    let len = G_HISTORY_LEN[slot] as usize;
+    Some(&G_HISTORY[slot][..len])
+}
+
+/// Navigate history down (newer). Returns the entry to display, or
+/// None if we're back at the "current line" (cursor == -1).
+pub unsafe fn nav_down() -> Option<&'static [u8]> {
+    if G_NAV_CURSOR <= 0 {
+        // Back to current line.
+        G_NAV_CURSOR = -1;
+        return None;
+    }
+    G_NAV_CURSOR -= 1;
+    let logical = G_HISTORY_COUNT - 1 - G_NAV_CURSOR as usize;
+    let slot = logical % HISTORY_SIZE;
+    let len = G_HISTORY_LEN[slot] as usize;
+    Some(&G_HISTORY[slot][..len])
+}
+
 // ── History expansion ───────────────────────────────────────────────────
 
 /// Expand history references in a line. Supports:
@@ -227,6 +281,13 @@ fn split_dir_and_prefix(tok: &[u8]) -> (&[u8], &[u8]) {
         Some(idx) => (&tok[..idx + 1], &tok[idx + 1..]),
         None => (b"", tok),
     }
+}
+
+fn entry_startswith(entry: &[u8], prefix: &[u8]) -> bool {
+    if entry.len() < prefix.len() {
+        return false;
+    }
+    &entry[..prefix.len()] == prefix
 }
 
 /// Scan a directory and return a list of entry names.
@@ -407,6 +468,10 @@ impl ConstDefault for u8 {
     const CONST_DEFAULT: Self = 0;
 }
 
+impl ConstDefault for usize {
+    const CONST_DEFAULT: Self = 0;
+}
+
 impl ConstDefault for [u8; 64] {
     const CONST_DEFAULT: Self = [0u8; 64];
 }
@@ -419,4 +484,167 @@ impl Vec<u8> {
     pub fn as_slice(&self) -> &[u8] {
         &self.items[..self.len]
     }
+}
+
+// ── Tab completion ─────────────────────────────────────────────────────
+//
+// When the user presses Tab, the shell calls tab_complete() with the
+// current line buffer and cursor position. The function:
+//   1. Finds the token under the cursor.
+//   2. If it's the first word, matches against built-in command names.
+//   3. Always matches against filesystem entries in the token's directory.
+//   4. If one match: fills in the full name + trailing space.
+//   5. If multiple matches: fills in the common prefix; if no new prefix,
+//      prints all matches.
+//   6. Returns the new line contents and new cursor position.
+
+/// Built-in command names for tab completion of the first word.
+const BUILTINS: &[&[u8]] = &[
+    b"ls", b"cat", b"cp", b"mv", b"rm", b"mkdir", b"touch", b"stat",
+    b"cd", b"pwd", b"echo", b"whoami", b"uname", b"date", b"clear",
+    b"help", b"exit", b"exec", b"run", b"ver",
+];
+
+/// Result of a tab completion attempt.
+pub struct TabResult {
+    /// New line contents (may be unchanged if no matches).
+    pub line: Vec<u8>,
+    /// New cursor position.
+    pub cursor: usize,
+    /// True if we printed matches to the screen (so the caller should
+    /// reprint the prompt + line on a fresh line).
+    pub printed: bool,
+}
+
+/// Attempt tab completion. `line` is the current input, `cursor` is the
+/// byte offset of the cursor within `line`.
+pub unsafe fn tab_complete(line: &[u8], cursor: usize) -> TabResult {
+    // Find the start of the current token (last whitespace before cursor).
+    let mut tok_start = cursor;
+    while tok_start > 0 && !io::is_whitespace(line[tok_start - 1]) {
+        tok_start -= 1;
+    }
+    let tok = &line[tok_start..cursor];
+    let is_first_word = {
+        let mut i = 0;
+        while i < tok_start && io::is_whitespace(line[i]) {
+            i += 1;
+        }
+        i == tok_start
+    };
+
+    // Collect matches.
+    let mut matches: Vec<[u8; 64]> = Vec::new();
+    let mut match_lens: Vec<usize> = Vec::new();
+
+    if is_first_word {
+        for &builtin in BUILTINS {
+            if builtin.starts_with(tok) {
+                let mut buf = [0u8; 64];
+                let n = builtin.len().min(63);
+                buf[..n].copy_from_slice(&builtin[..n]);
+                matches.push(buf);
+                match_lens.push(n);
+            }
+        }
+    }
+
+    // Filesystem completion.
+    let (dir_path, file_prefix) = split_dir_and_prefix(tok);
+    let entries = scan_dir_entries(dir_path);
+    for entry in entries.iter() {
+        let entry_len = entry.iter().position(|&b| b == 0).unwrap_or(entry.len());
+        if entry_startswith(&entry[..entry_len], file_prefix) {
+            let mut buf = [0u8; 64];
+            let n = entry_len.min(63);
+            buf[..n].copy_from_slice(&entry[..n]);
+            matches.push(buf);
+            match_lens.push(n);
+        }
+    }
+
+    if matches.is_empty() {
+        return TabResult {
+            line: line_to_vec(line),
+            cursor,
+            printed: false,
+        };
+    }
+
+    if matches.len() == 1 {
+        // Single match — fill in the full entry + a trailing space.
+        let m = &matches[0];
+        let m_len = match_lens[0];
+        let mut new_line: Vec<u8> = Vec::new();
+        new_line.extend_from_slice(&line[..tok_start]);
+        new_line.extend_from_slice(&m[..m_len]);
+        new_line.push(b' ');
+        new_line.extend_from_slice(&line[cursor..]);
+        let new_cursor = tok_start + m_len + 1;
+        return TabResult {
+            line: new_line,
+            cursor: new_cursor,
+            printed: false,
+        };
+    }
+
+    // Multiple matches — fill in the common prefix.
+    let mut common = match_lens[0];
+    for i in 1..matches.len() {
+        let m = &matches[i];
+        let m_len = match_lens[i];
+        let cmp_len = common.min(m_len);
+        let mut j = 0;
+        while j < cmp_len && matches[0][j] == m[j] {
+            j += 1;
+        }
+        common = j;
+        if common == 0 {
+            break;
+        }
+    }
+    let mut printed = false;
+    if common > tok.len() {
+        // We can extend the token with the common prefix.
+        let mut new_line: Vec<u8> = Vec::new();
+        new_line.extend_from_slice(&line[..tok_start]);
+        new_line.extend_from_slice(&matches[0][..common]);
+        new_line.extend_from_slice(&line[cursor..]);
+        let new_cursor = tok_start + common;
+        // Also print all matches so the user sees the options.
+        io::newline();
+        for i in 0..matches.len() {
+            let m_len = match_lens[i];
+            io::write_raw(&matches[i][..m_len]);
+            io::write_raw(b"  ");
+        }
+        io::newline();
+        printed = true;
+        TabResult {
+            line: new_line,
+            cursor: new_cursor,
+            printed,
+        }
+    } else {
+        // No common prefix to add — just print the matches.
+        io::newline();
+        for i in 0..matches.len() {
+            let m_len = match_lens[i];
+            io::write_raw(&matches[i][..m_len]);
+            io::write_raw(b"  ");
+        }
+        io::newline();
+        printed = true;
+        TabResult {
+            line: line_to_vec(line),
+            cursor,
+            printed,
+        }
+    }
+}
+
+fn line_to_vec(line: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(line);
+    v
 }
