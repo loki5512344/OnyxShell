@@ -26,6 +26,7 @@
 use core::arch::asm;
 
 mod commands;
+mod features;
 mod io;
 mod path;
 mod pipeline;
@@ -84,34 +85,71 @@ pub unsafe extern "C" fn _start() -> ! {
 
         let raw = unsafe { &G_LINE[..end] };
 
+        // History expansion: `!!`, `!N`, `!-N` are replaced with the
+        // corresponding history entry before execution. The expanded
+        // line is what gets tokenized and run.
+        let expanded = unsafe { features::history_expand(raw) };
+        let expanded_slice = expanded.as_slice();
+        // Push the (expanded) line into history for future reference.
+        unsafe { features::history_push(expanded_slice); }
+
         // Check if the line contains a pipe `|` or redirect `>` / `<`.
-        // If so, parse and execute via the pipeline module. Otherwise
-        // fall back to the simple single-command dispatch path.
-        let has_pipe_or_redirect = raw.iter().any(|&b| b == b'|' || b == b'>' || b == b'<');
+        let has_pipe_or_redirect = expanded_slice.iter().any(|&b| b == b'|' || b == b'>' || b == b'<');
         if has_pipe_or_redirect {
-            let p = pipeline::parse(raw);
-            unsafe { pipeline::execute(raw, &p); }
+            // For pipelines we don't glob-expand (would need to expand per-segment).
+            // Copy into a static buffer so pipeline::parse can take a &[u8].
+            static mut G_EXPANDED: [u8; LINE_MAX] = [0u8; LINE_MAX];
+            let n = expanded_slice.len().min(LINE_MAX - 1);
+            unsafe {
+                for i in 0..n {
+                    G_EXPANDED[i] = expanded_slice[i];
+                }
+                G_EXPANDED[n] = 0;
+                let p = pipeline::parse(&G_EXPANDED[..n]);
+                pipeline::execute(&G_EXPANDED[..n], &p);
+            }
             continue;
         }
 
         // Tokenize into arguments.
-        let ntok = io::tokenize(raw, unsafe { &mut G_TOKEN_OFFSETS });
+        let ntok = io::tokenize(expanded_slice, unsafe { &mut G_TOKEN_OFFSETS });
         if ntok == 0 {
             continue;
         }
 
-        // Build a slice of argument slices for the dispatcher.
-        // We use a static array to avoid stack allocation.
-        static mut G_ARGS: [&[u8]; commands::MAX_ARGS] = [&[]; commands::MAX_ARGS];
+        // Glob expansion: expand wildcards (`*`, `?`, `[...]`) in each
+        // token into a list of matching filesystem paths. Tokens without
+        // glob characters pass through unchanged.
+        static mut G_EXPANDED_ARGS: [[u8; 128]; 32] = [[0u8; 128]; 32];
+        static mut G_ARGS: [&[u8]; 32] = [&[]; 32];
+        let mut n_args = 0usize;
         unsafe {
             for i in 0..ntok {
                 let (off, len) = G_TOKEN_OFFSETS[i];
-                G_ARGS[i] = &raw[off..off + len];
+                let tok = &expanded_slice[off..off + len];
+                let expansions = features::glob_expand(tok);
+                for j in 0..expansions.len() {
+                    if n_args >= 32 {
+                        break;
+                    }
+                    let exp = expansions[j];
+                    // Find NUL terminator (or use full length).
+                    let mut elen = 0;
+                    while elen < 127 && exp[elen] != 0 {
+                        elen += 1;
+                    }
+                    G_EXPANDED_ARGS[n_args] = exp;
+                    G_ARGS[n_args] = &G_EXPANDED_ARGS[n_args][..elen];
+                    n_args += 1;
+                }
+                if n_args >= 32 {
+                    break;
+                }
             }
         }
 
         // Dispatch to the command handler.
-        commands::dispatch(unsafe { &G_ARGS[..ntok] });
+        commands::dispatch(unsafe { &G_ARGS[..n_args] });
     }
 }
 
