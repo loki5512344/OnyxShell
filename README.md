@@ -1,6 +1,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-RISC--V%2064--bit-green" alt="RISC-V 64">
-  <img src="https://img.shields.io/badge/language-Rust%20100%25-orange" alt="Rust 90%">
+  <img src="https://img.shields.io/badge/language-Rust%2090%25-orange" alt="Rust 90%">
   <img src="https://img.shields.io/badge/version-v0.2-blue" alt="v0.2">
   <img src="https://img.shields.io/badge/target-OnyxOS-yellow" alt="OnyxOS">
   <img src="https://img.shields.io/badge/license-GPL--3.0-red" alt="GPL-3.0">
@@ -39,7 +39,7 @@
 
 OnyxShell (`/bin/osh`) is the default command-line shell for
 [OnyxOS](https://github.com/loki5512344/OnyxKernel). It is a freestanding
-RISC-V 64-bit binary written in 100% Rust (`no_std`, `no_main`) that compiles
+RISC-V 64-bit binary written in 90% Rust (`no_std`, `no_main`) that compiles
 to the OnyxExec v2 format and runs in ring 1 (root space) when launched by
 `/bin/login`.
 
@@ -54,7 +54,7 @@ Part of the [OnyxOS](https://github.com/loki5512344/OnyxKernel) ecosystem.
 
 ## Key Features
 
-- **100% Rust** — `no_std`, `no_main`, compiled with `riscv64gc-unknown-none-elf`
+- **90% Rust** — `no_std`, `no_main`, compiled with `riscv64gc-unknown-none-elf`
 - **OnyxExec v2 format** — compressed with `elf2onx --ring=1 --compress`
 - **20 built-in commands** — `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `touch`,
   `stat`, `cd`, `pwd`, `echo`, `whoami`, `uname`, `date`, `clear`, `help`,
