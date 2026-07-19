@@ -1,6 +1,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-RISC--V%2064--bit-green" alt="RISC-V 64">
-  <img src="https://img.shields.io/badge/language-Rust%20100%25-orange" alt="Rust 100%">
+  <img src="https://img.shields.io/badge/language-Rust%20100%25-orange" alt="Rust 90%">
   <img src="https://img.shields.io/badge/version-v0.2-blue" alt="v0.2">
   <img src="https://img.shields.io/badge/target-OnyxOS-yellow" alt="OnyxOS">
   <img src="https://img.shields.io/badge/license-GPL--3.0-red" alt="GPL-3.0">
