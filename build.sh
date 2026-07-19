@@ -38,7 +38,8 @@ cp "$ELF" "$HERE/build/onyx-osh"
 if [ ! -f "$ELF2ONX" ]; then
     echo "==> elf2onx not found at $ELF2ONX"
     echo "    Building elf2onx from OnyxKernel..."
-    (cd "$ONYXKERNEL_DIR" && cargo build --release -p onyx_tools 2>&1 | tail -3)
+    HOST_TARGET=$(rustc -vV | sed -ne 's/^host: //p')
+    (cd "$ONYXKERNEL_DIR" && cargo build --release -p onyx_tools --target "$HOST_TARGET" 2>&1 | tail -3)
 fi
 
 if [ ! -f "$ELF2ONX" ]; then
