@@ -16,7 +16,8 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ONYXKERNEL_DIR="${ONYXKERNEL_DIR:-$(cd "$HERE/../OnyxKernel" && pwd)}"
-ELF2ONX="$ONYXKERNEL_DIR/target/release/elf2onx"
+HOST_TARGET=$(rustc -vV | sed -ne 's/^host: //p')
+ELF2ONX="$ONYXKERNEL_DIR/target/$HOST_TARGET/release/elf2onx"
 
 # Build the shell (release mode, riscv64gc target).
 echo "==> Building OnyxShell"
@@ -39,7 +40,7 @@ if [ ! -f "$ELF2ONX" ]; then
     echo "==> elf2onx not found at $ELF2ONX"
     echo "    Building elf2onx from OnyxKernel..."
     HOST_TARGET=$(rustc -vV | sed -ne 's/^host: //p')
-    (cd "$ONYXKERNEL_DIR" && cargo build --release -p onyx_tools --target "$HOST_TARGET" 2>&1 | tail -3)
+    (cd "$ONYXKERNEL_DIR" && cargo build --release -p onyx_tools --target "$HOST_TARGET")
 fi
 
 if [ ! -f "$ELF2ONX" ]; then
