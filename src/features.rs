@@ -733,7 +733,7 @@ pub unsafe fn expand_tilde(line: &[u8]) -> Vec<u8> {
 const BUILTINS: &[&[u8]] = &[
     b"ls", b"cat", b"cp", b"mv", b"rm", b"mkdir", b"touch", b"stat", b"cd", b"pwd", b"echo",
     b"whoami", b"uname", b"date", b"clear", b"help", b"exit", b"exec", b"run", b"ver", b"export",
-    b"set", b"unset",
+    b"set", b"unset", b"jobs", b"fg", b"bg",
 ];
 /// Result of a tab completion attempt.
 pub struct TabResult {
@@ -869,6 +869,136 @@ pub unsafe fn tab_complete(line: &[u8], cursor: usize) -> TabResult {
             line: line_to_vec(line),
             cursor,
             printed,
+        }
+    }
+}
+
+// ── Background job management ──────────────────────────────────────────
+//
+// Simple flat array of background jobs (PID + running flag).
+// Jobs are numbered sequentially with a global counter.
+
+pub const JOB_MAX: usize = 16;
+
+static mut G_JOB_IDS: [usize; JOB_MAX] = [0; JOB_MAX];
+static mut G_JOB_PIDS: [i32; JOB_MAX] = [0; JOB_MAX];
+static mut G_JOB_RUNNING: [bool; JOB_MAX] = [false; JOB_MAX];
+static mut G_JOB_NEXT_ID: usize = 1;
+static mut G_JOB_COUNT: usize = 0;
+
+/// Add a background job. Returns the job number (for [N] display), or 0 if full.
+pub unsafe fn job_add(pid: i32) -> usize {
+    if G_JOB_COUNT >= JOB_MAX {
+        return 0;
+    }
+    let idx = G_JOB_COUNT;
+    let job_id = G_JOB_NEXT_ID;
+    G_JOB_NEXT_ID = G_JOB_NEXT_ID.wrapping_add(1);
+    G_JOB_IDS[idx] = job_id;
+    G_JOB_PIDS[idx] = pid;
+    G_JOB_RUNNING[idx] = true;
+    G_JOB_COUNT += 1;
+    job_id
+}
+
+/// Remove a job by its job number. Returns true if found.
+pub unsafe fn job_remove_by_id(job_id: usize) -> bool {
+    for i in 0..G_JOB_COUNT {
+        if G_JOB_IDS[i] == job_id {
+            for j in i..G_JOB_COUNT - 1 {
+                G_JOB_IDS[j] = G_JOB_IDS[j + 1];
+                G_JOB_PIDS[j] = G_JOB_PIDS[j + 1];
+                G_JOB_RUNNING[j] = G_JOB_RUNNING[j + 1];
+            }
+            G_JOB_COUNT -= 1;
+            return true;
+        }
+    }
+    false
+}
+
+/// Find a job by number. Returns (id, pid, running) if found.
+pub unsafe fn job_find_by_id(job_id: usize) -> Option<(usize, i32, bool)> {
+    for i in 0..G_JOB_COUNT {
+        if G_JOB_IDS[i] == job_id {
+            return Some((G_JOB_IDS[i], G_JOB_PIDS[i], G_JOB_RUNNING[i]));
+        }
+    }
+    None
+}
+
+/// Mark a job as running (or not).
+pub unsafe fn job_set_running(job_id: usize, running: bool) -> bool {
+    for i in 0..G_JOB_COUNT {
+        if G_JOB_IDS[i] == job_id {
+            G_JOB_RUNNING[i] = running;
+            return true;
+        }
+    }
+    false
+}
+
+/// Number of tracked background jobs.
+#[allow(dead_code)]
+pub unsafe fn job_count() -> usize {
+    G_JOB_COUNT
+}
+
+/// Get job info by index in the internal array (0..job_count).
+#[allow(dead_code)]
+pub unsafe fn job_get_by_index(idx: usize) -> Option<(usize, i32, bool)> {
+    if idx >= G_JOB_COUNT {
+        return None;
+    }
+    Some((G_JOB_IDS[idx], G_JOB_PIDS[idx], G_JOB_RUNNING[idx]))
+}
+
+/// Print the job list (for the `jobs` built-in).
+pub unsafe fn job_list() {
+    for i in 0..G_JOB_COUNT {
+        io::write_raw(b"[");
+        io::write_u64(G_JOB_IDS[i] as u64);
+        io::write_raw(b"] ");
+        io::write_i64(G_JOB_PIDS[i] as i64);
+        io::write_raw(b" ");
+        if G_JOB_RUNNING[i] {
+            io::write_raw(b"Running");
+        } else {
+            io::write_raw(b"Done");
+        }
+        io::newline();
+    }
+}
+
+/// Poll for completed children with waitpid(WNOHANG).
+/// Removes finished jobs and prints "[N] PID Done".
+pub unsafe fn job_reap() {
+    loop {
+        let mut status: i32 = 0;
+        let pid = crate::syscalls::waitpid(0xFFFF_FFFF, &mut status, crate::syscalls::WNOHANG);
+        if pid <= 0 {
+            break;
+        }
+        let mut found = false;
+        for i in 0..G_JOB_COUNT {
+            if G_JOB_PIDS[i] as i64 == pid {
+                io::write_raw(b"[");
+                io::write_u64(G_JOB_IDS[i] as u64);
+                io::write_raw(b"] ");
+                io::write_i64(pid);
+                io::write_raw(b" Done\n");
+                for j in i..G_JOB_COUNT - 1 {
+                    G_JOB_IDS[j] = G_JOB_IDS[j + 1];
+                    G_JOB_PIDS[j] = G_JOB_PIDS[j + 1];
+                    G_JOB_RUNNING[j] = G_JOB_RUNNING[j + 1];
+                }
+                G_JOB_COUNT -= 1;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Child wasn't one of our tracked jobs — just ignore.
         }
     }
 }

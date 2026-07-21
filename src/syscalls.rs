@@ -56,6 +56,7 @@ pub const SYS_isatty: u64 = 66;
 pub const SYS_pipe: u64 = 36;
 pub const SYS_dup: u64 = 35;
 pub const SYS_fork: u64 = 63;
+pub const SYS_kill: u64 = 62;
 pub const SYS_getdents: u64 = 77;
 pub const SYS_ioctl: u64 = 53;
 
@@ -79,6 +80,11 @@ pub const SEEK_END: u32 = 2;
 
 // ── waitpid() options ────────────────────────────────────────────────────
 pub const WNOHANG: u32 = 1;
+
+// ── Signal numbers (Linux-compatible) ────────────────────────────────────
+pub const SIGCONT: i32 = 18;
+
+// ── errno values (from onyx-core/src/errno.rs) ───────────────────────────
 
 // ── errno values (from onyx-core/src/errno.rs) ───────────────────────────
 // These are the actual negative return codes from OnyxKernel syscalls.
@@ -276,6 +282,21 @@ pub unsafe fn fork() -> i64 {
     asm!(
         "ecall",
         in("a7") SYS_fork,
+        lateout("a0") ret,
+    );
+    ret
+}
+
+/// kill(pid, sig) → 0 on success or negative errno.
+/// Sends signal `sig` to process `pid`.
+#[inline]
+pub unsafe fn kill(pid: i32, sig: i32) -> i64 {
+    let ret: i64;
+    asm!(
+        "ecall",
+        in("a7") SYS_kill,
+        in("a0") pid as usize,
+        in("a1") sig as usize,
         lateout("a0") ret,
     );
     ret

@@ -20,6 +20,10 @@ pub const MAX_ARGS: usize = 16;
 
 /// Dispatch a tokenized command line.
 pub fn dispatch(args: &[&[u8]]) {
+    // Reap finished background jobs before running any command.
+    unsafe {
+        features::job_reap();
+    }
     if args.is_empty() {
         return;
     }
@@ -64,6 +68,12 @@ pub fn dispatch(args: &[&[u8]]) {
         cmd_clear(rest);
     } else if cmd == b"exit" || cmd == b"logout" {
         cmd_exit(rest);
+    } else if cmd == b"jobs" {
+        cmd_jobs(rest);
+    } else if cmd == b"fg" {
+        cmd_fg(rest);
+    } else if cmd == b"bg" {
+        cmd_bg(rest);
     } else if cmd == b"exec" {
         cmd_exec(rest);
     } else if cmd == b"run" {
@@ -112,6 +122,9 @@ fn cmd_help(_args: &[&[u8]]) {
     io::write_line("Process:");
     io::write_line("  exec <path> [args]  replace shell with binary");
     io::write_line("  run <path> [args]   run binary as child (root only)");
+    io::write_line("  jobs                list background jobs");
+    io::write_line("  fg %<jobid>         bring job to foreground");
+    io::write_line("  bg %<jobid>         continue job in background");
     io::write_line("  exit                exit the shell");
     io::write_line("");
     io::write_line("Note: rm, mkdir, cp, mv, touch require root (ring 1).");
@@ -956,5 +969,87 @@ fn cmd_run(args: &[&[u8]]) {
         io::write_raw(b"osh: process exited with code ");
         io::write_i64(status as i64);
         io::newline();
+    }
+}
+
+// ─── jobs ────────────────────────────────────────────────────────────────
+
+fn cmd_jobs(_args: &[&[u8]]) {
+    unsafe {
+        features::job_list();
+    }
+}
+
+// ─── fg ──────────────────────────────────────────────────────────────────
+
+fn cmd_fg(args: &[&[u8]]) {
+    if args.is_empty() {
+        io::write_error("fg: usage: fg %<jobid>");
+        return;
+    }
+    let job_id = parse_job_id(args[0]);
+    if job_id == 0 {
+        io::write_error("fg: invalid job specifier (use %<number>)");
+        return;
+    }
+    unsafe {
+        if let Some((id, pid, _running)) = features::job_find_by_id(job_id) {
+            let mut status: i32 = 0;
+            syscalls::waitpid(pid as u64, &mut status, 0);
+            io::write_raw(b"[");
+            io::write_u64(id as u64);
+            io::write_raw(b"] ");
+            io::write_i64(pid as i64);
+            io::write_raw(b" Done\n");
+            features::job_remove_by_id(id);
+        } else {
+            io::write_error("fg: job not found");
+        }
+    }
+}
+
+// ─── bg ──────────────────────────────────────────────────────────────────
+
+fn cmd_bg(args: &[&[u8]]) {
+    if args.is_empty() {
+        io::write_error("bg: usage: bg %<jobid>");
+        return;
+    }
+    let job_id = parse_job_id(args[0]);
+    if job_id == 0 {
+        io::write_error("bg: invalid job specifier (use %<number>)");
+        return;
+    }
+    unsafe {
+        if let Some((id, pid, running)) = features::job_find_by_id(job_id) {
+            if !running {
+                syscalls::kill(pid, syscalls::SIGCONT);
+                features::job_set_running(id, true);
+            }
+            io::write_raw(b"[");
+            io::write_u64(id as u64);
+            io::write_raw(b"] ");
+            io::write_i64(pid as i64);
+            io::newline();
+        } else {
+            io::write_error("bg: job not found");
+        }
+    }
+}
+
+/// Parse a job specifier like `%1` → 1. Returns 0 on invalid input.
+fn parse_job_id(arg: &[u8]) -> usize {
+    if arg.len() > 1 && arg[0] == b'%' {
+        let mut id = 0usize;
+        for &b in &arg[1..] {
+            if b >= b'0' && b <= b'9' {
+                id = id * 10 + (b - b'0') as usize;
+            } else {
+                return 0;
+            }
+        }
+        id
+    } else {
+        0
     }
 }

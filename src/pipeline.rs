@@ -18,6 +18,7 @@
 //! are detected and run in the parent process before the pipeline runs.
 
 use crate::commands;
+use crate::features;
 use crate::io;
 use crate::syscalls;
 
@@ -31,7 +32,7 @@ pub struct Segment {
     pub n_args: usize,
 }
 
-/// Parsed pipeline: segments + optional redirect targets.
+/// Parsed pipeline: segments + optional redirect targets + background flag.
 pub struct Pipeline {
     pub segments: [Segment; MAX_SEGMENTS],
     pub n_segments: usize,
@@ -39,6 +40,8 @@ pub struct Pipeline {
     pub stdout_file: (usize, usize),
     /// Offset/len into the line buffer for the `< file` source, or (0,0) if none.
     pub stdin_file: (usize, usize),
+    /// True if the command ends with `&` (run in background).
+    pub background: bool,
 }
 
 /// Parse a line into a Pipeline. The line is the raw input (no trailing newline).
@@ -51,6 +54,7 @@ pub fn parse(line: &[u8]) -> Pipeline {
         n_segments: 0,
         stdout_file: (0, 0),
         stdin_file: (0, 0),
+        background: false,
     };
 
     let mut i = 0;
@@ -103,6 +107,19 @@ pub fn parse(line: &[u8]) -> Pipeline {
         }
         p.segments[seg_idx].n_args = n_args;
     }
+
+    // Check for `&` at the end of the last segment.
+    if p.n_segments > 0 {
+        let last = &mut p.segments[p.n_segments - 1];
+        if last.n_args > 0 {
+            let (off, len) = last.args[last.n_args - 1];
+            if len == 1 && line[off] == b'&' {
+                last.n_args -= 1;
+                p.background = true;
+            }
+        }
+    }
+
     p
 }
 
@@ -113,7 +130,10 @@ pub fn parse(line: &[u8]) -> Pipeline {
 /// For multi-segment pipelines or redirects, fork for each segment and
 /// wire stdin/stdout accordingly.
 pub unsafe fn execute(line: &[u8], p: &Pipeline) {
-    // If there's only one segment and no redirects, just dispatch.
+    // Reap any finished background children before executing.
+    features::job_reap();
+
+    // If there's only one segment and no redirects, just dispatch (or fork for bg).
     if p.n_segments == 1 && p.stdout_file.1 == 0 && p.stdin_file.1 == 0 {
         let seg = &p.segments[0];
         if seg.n_args == 0 {
@@ -131,6 +151,26 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
             }
             G_ARGS_BUF[i][n] = 0;
             G_ARGS[i] = &G_ARGS_BUF[i][..n];
+        }
+        if p.background {
+            let pid = syscalls::fork();
+            if pid < 0 {
+                io::write_error_errno("fork", pid);
+                return;
+            }
+            if pid == 0 {
+                // Child: run command and exit.
+                commands::dispatch(&G_ARGS[..seg.n_args]);
+                syscalls::exit(0);
+            }
+            // Parent: register background job.
+            let job_id = features::job_add(pid as i32);
+            io::write_raw(b"[");
+            io::write_u64(job_id as u64);
+            io::write_raw(b"] ");
+            io::write_i64(pid);
+            io::newline();
+            return;
         }
         commands::dispatch(&G_ARGS[..seg.n_args]);
         return;
@@ -219,6 +259,7 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
 
     // Fork for each segment. Each child wires its stdin/stdout and execs.
     let mut prev_read_fd: i64 = stdin_fd; // start from redirect stdin (or 0)
+    let mut last_pid: i64 = 0;
     for seg_idx in 0..p.n_segments {
         let seg = &p.segments[seg_idx];
         if seg.n_args == 0 {
@@ -291,11 +332,23 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
         if cur_write_fd > 2 && cur_write_fd != stdout_fd {
             syscalls::close(cur_write_fd as u64);
         }
-        // Wait for the child to finish before starting the next segment.
-        // (Sequential pipeline — simpler than parallel, and avoids the
-        // kernel's waitpid limitations.)
-        let mut status: i32 = 0;
-        syscalls::waitpid(pid as u64, &mut status, 0);
+        last_pid = pid;
+        // Wait for the child to finish before starting the next segment,
+        // unless this is a background job.
+        if !p.background {
+            let mut status: i32 = 0;
+            syscalls::waitpid(pid as u64, &mut status, 0);
+        }
+    }
+
+    // If this was a background pipeline, register the last child as a job.
+    if p.background && last_pid > 0 {
+        let job_id = features::job_add(last_pid as i32);
+        io::write_raw(b"[");
+        io::write_u64(job_id as u64);
+        io::write_raw(b"] ");
+        io::write_i64(last_pid);
+        io::newline();
     }
 }
 
