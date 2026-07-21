@@ -733,7 +733,7 @@ pub unsafe fn expand_tilde(line: &[u8]) -> Vec<u8> {
 const BUILTINS: &[&[u8]] = &[
     b"ls", b"cat", b"cp", b"mv", b"rm", b"mkdir", b"touch", b"stat", b"cd", b"pwd", b"echo",
     b"whoami", b"uname", b"date", b"clear", b"help", b"exit", b"exec", b"run", b"ver", b"export",
-    b"set", b"unset", b"jobs", b"fg", b"bg",
+    b"set", b"unset", b"jobs", b"fg", b"bg", b"source",
 ];
 /// Result of a tab completion attempt.
 pub struct TabResult {

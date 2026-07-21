@@ -41,8 +41,25 @@ static mut G_LINE: [u8; LINE_MAX] = [0u8; LINE_MAX];
 static mut G_TOKEN_OFFSETS: [(usize, usize); 16] = [(0usize, 0usize); 16];
 
 /// Entry point — called by the kernel's OnyxExec loader.
+/// a0 = argc, a1 = argv (RISC-V standard calling convention).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub unsafe extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
+    // ── Batch mode ───────────────────────────────────────────────────────
+    // If a script file path is passed as the first argument, run it and exit.
+    if argc > 1 && !argv.is_null() {
+        let script_ptr = *argv.add(1);
+        if !script_ptr.is_null() {
+            let mut path = [0u8; 256];
+            let mut i = 0;
+            while *script_ptr.add(i) != 0 && i < 255 {
+                path[i] = *script_ptr.add(i);
+                i += 1;
+            }
+            commands::do_script(&path[..i]);
+        }
+        syscalls::exit(0);
+    }
+
     syscalls::write(1, VERSION_BANNER.as_ptr(), VERSION_BANNER.len());
 
     features::env_init();

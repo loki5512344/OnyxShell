@@ -13,10 +13,14 @@
 use crate::features;
 use crate::io;
 use crate::path;
+use crate::pipeline;
 use crate::syscalls;
 
 /// Maximum number of arguments per command line.
 pub const MAX_ARGS: usize = 16;
+
+/// Maximum input line length (matches main.rs).
+const LINE_MAX: usize = 256;
 
 /// Dispatch a tokenized command line.
 pub fn dispatch(args: &[&[u8]]) {
@@ -78,6 +82,8 @@ pub fn dispatch(args: &[&[u8]]) {
         cmd_exec(rest);
     } else if cmd == b"run" {
         cmd_run(rest);
+    } else if cmd == b"source" || cmd == b"." {
+        cmd_source(rest);
     } else if cmd == b"date" {
         cmd_date(rest);
     } else if cmd == b"ver" || cmd == b"version" {
@@ -881,6 +887,55 @@ fn cmd_exec(args: &[&[u8]]) {
         return;
     }
 
+    // ── Shebang check ──
+    if let Some(interp_buf) = check_shebang(path_buf.as_ptr()) {
+        let interp_len = interp_buf.iter().position(|&b| b == 0).unwrap_or(256);
+        if interp_len > 0 && &interp_buf[..interp_len] == b"/bin/osh" {
+            // Run as osh script in current context, then exit
+            do_script(&path_buf[..len]);
+            unsafe {
+                syscalls::exit(0);
+            }
+        }
+        // Exec with interpreter: argv = [interp, script, args[1..]]
+        let mut argv_strs: [[u8; path::PATH_MAX]; MAX_ARGS] = [[0; path::PATH_MAX]; MAX_ARGS];
+        let mut argv_ptrs = [0u64; MAX_ARGS + 1];
+        let mut argc = 0usize;
+        argv_strs[argc][..interp_len].copy_from_slice(&interp_buf[..interp_len]);
+        argv_strs[argc][interp_len] = 0;
+        argv_ptrs[argc] = argv_strs[argc].as_ptr() as u64;
+        argc += 1;
+        let path_slice = &path_buf[..len];
+        argv_strs[argc][..path_slice.len()].copy_from_slice(path_slice);
+        argv_strs[argc][path_slice.len()] = 0;
+        argv_ptrs[argc] = argv_strs[argc].as_ptr() as u64;
+        argc += 1;
+        for i in 1..args.len().min(MAX_ARGS - 2) {
+            let arg = args[i];
+            if arg.len() >= path::PATH_MAX {
+                break;
+            }
+            argv_strs[argc][..arg.len()].copy_from_slice(arg);
+            argv_strs[argc][arg.len()] = 0;
+            argv_ptrs[argc] = argv_strs[argc].as_ptr() as u64;
+            argc += 1;
+        }
+        argv_ptrs[argc] = 0;
+        let mut envp_strs =
+            [[0u8; features::ENV_KEY_MAX + features::ENV_VAL_MAX + 2]; features::ENV_MAX];
+        let mut envp_ptrs = [0u64; features::ENV_MAX + 1];
+        let _n_env = unsafe { features::build_envp(&mut envp_strs, &mut envp_ptrs) };
+        let ret = unsafe {
+            syscalls::execve(
+                argv_strs[0].as_ptr(),
+                argv_ptrs.as_ptr(),
+                envp_ptrs.as_ptr(),
+            )
+        };
+        io::write_error_errno("exec", ret);
+        return;
+    }
+
     // Build argv: array of pointers to NUL-terminated strings.
     let mut argv_strs: [[u8; path::PATH_MAX]; MAX_ARGS] = [[0; path::PATH_MAX]; MAX_ARGS];
     let mut argv_ptrs = [0u64; MAX_ARGS + 1];
@@ -930,6 +985,59 @@ fn cmd_run(args: &[&[u8]]) {
     };
     if len == 0 {
         io::write_error("run: path too long");
+        return;
+    }
+
+    // ── Shebang check ──
+    if let Some(interp_buf) = check_shebang(path_buf.as_ptr()) {
+        let interp_len = interp_buf.iter().position(|&b| b == 0).unwrap_or(256);
+        let target: &[u8] = if interp_len > 0 && &interp_buf[..interp_len] == b"/bin/osh" {
+            b"/bin/osh"
+        } else {
+            &interp_buf[..interp_len]
+        };
+        let mut argv_strs: [[u8; path::PATH_MAX]; MAX_ARGS] = [[0; path::PATH_MAX]; MAX_ARGS];
+        let mut argv_ptrs = [0u64; MAX_ARGS + 1];
+        let mut argc = 0usize;
+        // argv[0] = interpreter
+        argv_strs[argc][..target.len()].copy_from_slice(target);
+        argv_strs[argc][target.len()] = 0;
+        argv_ptrs[argc] = argv_strs[argc].as_ptr() as u64;
+        argc += 1;
+        // argv[1] = script path
+        let path_slice = &path_buf[..len];
+        argv_strs[argc][..path_slice.len()].copy_from_slice(path_slice);
+        argv_strs[argc][path_slice.len()] = 0;
+        argv_ptrs[argc] = argv_strs[argc].as_ptr() as u64;
+        argc += 1;
+        // argv[2..] = remaining args
+        for i in 1..args.len().min(MAX_ARGS - 2) {
+            let arg = args[i];
+            if arg.len() >= path::PATH_MAX {
+                break;
+            }
+            argv_strs[argc][..arg.len()].copy_from_slice(arg);
+            argv_strs[argc][arg.len()] = 0;
+            argv_ptrs[argc] = argv_strs[argc].as_ptr() as u64;
+            argc += 1;
+        }
+        argv_ptrs[argc] = 0;
+        let pid = unsafe { syscalls::spawn(argv_strs[0].as_ptr(), argv_ptrs.as_ptr(), 0) };
+        if pid < 0 {
+            io::write_error_errno("run", pid);
+            return;
+        }
+        let mut status: i32 = 0;
+        let waited = unsafe { syscalls::wait(&mut status) };
+        if waited < 0 {
+            io::write_error_errno("run: wait", waited);
+            return;
+        }
+        if status != 0 {
+            io::write_raw(b"osh: process exited with code ");
+            io::write_i64(status as i64);
+            io::newline();
+        }
         return;
     }
 
@@ -1052,4 +1160,168 @@ fn parse_job_id(arg: &[u8]) -> usize {
     } else {
         0
     }
+}
+
+// ─── source ──────────────────────────────────────────────────────────────
+
+fn cmd_source(args: &[&[u8]]) {
+    if args.is_empty() {
+        io::write_error("source: missing file operand (try 'help')");
+        return;
+    }
+    do_script(args[0]);
+}
+
+/// Execute a script file: open, read lines, dispatch each.
+/// Used by `source`, batch mode, and `#!/bin/osh` shebang handling.
+pub fn do_script(input: &[u8]) {
+    let mut abs = [0u8; path::PATH_MAX];
+    let len = path::resolve(input, &mut abs);
+    if len == 0 {
+        io::write_error("source: path too long");
+        return;
+    }
+
+    let fd = unsafe { syscalls::open(abs.as_ptr(), syscalls::O_RDONLY as u64, 0) };
+    if fd < 0 {
+        io::write_error_errno("source", fd);
+        return;
+    }
+
+    let mut line_buf = [0u8; LINE_MAX];
+    let mut line_pos = 0usize;
+    loop {
+        let mut c = [0u8; 1];
+        let n = unsafe { syscalls::read_fd(fd as u64, c.as_mut_ptr(), 1) };
+        if n <= 0 {
+            break;
+        }
+        if c[0] == b'\n' {
+            if line_pos > 0 && line_buf[0] != b'#' {
+                execute_line(&line_buf[..line_pos]);
+            }
+            line_pos = 0;
+        } else if c[0] != b'\r' && line_pos < LINE_MAX - 1 {
+            line_buf[line_pos] = c[0];
+            line_pos += 1;
+        }
+    }
+    if line_pos > 0 && line_buf[0] != b'#' {
+        execute_line(&line_buf[..line_pos]);
+    }
+
+    unsafe {
+        syscalls::close(fd as u64);
+    }
+}
+
+/// Execute a single line: tilde expansion, variable expansion,
+/// pipe/redirect check, tokenization, glob expansion, and dispatch.
+fn execute_line(line: &[u8]) {
+    let expanded = unsafe { features::expand_tilde(line) };
+    let expanded = unsafe { features::expand_vars(expanded.as_slice()) };
+    let expanded_slice = expanded.as_slice();
+
+    let has_pipe_or_redirect = expanded_slice
+        .iter()
+        .any(|&b| b == b'|' || b == b'>' || b == b'<');
+    if has_pipe_or_redirect {
+        static mut G_EXPANDED: [u8; LINE_MAX] = [0u8; LINE_MAX];
+        let n = expanded_slice.len().min(LINE_MAX - 1);
+        unsafe {
+            for j in 0..n {
+                G_EXPANDED[j] = expanded_slice[j];
+            }
+            G_EXPANDED[n] = 0;
+            let p = pipeline::parse(&G_EXPANDED[..n]);
+            pipeline::execute(&G_EXPANDED[..n], &p);
+        }
+        return;
+    }
+
+    static mut G_TOKEN_OFFSETS: [(usize, usize); 16] = [(0, 0); 16];
+    let ntok = io::tokenize(expanded_slice, unsafe { &mut G_TOKEN_OFFSETS });
+    if ntok == 0 {
+        return;
+    }
+
+    static mut G_EXPANDED_ARGS: [[u8; 128]; 32] = [[0u8; 128]; 32];
+    static mut G_ARGS: [&[u8]; 32] = [&[]; 32];
+    let mut n_args = 0usize;
+    for ti in 0..ntok {
+        let (off, len) = unsafe { G_TOKEN_OFFSETS[ti] };
+        let tok = &expanded_slice[off..off + len];
+        let expansions = features::glob_expand(tok);
+        for j in 0..expansions.len() {
+            if n_args >= 32 {
+                break;
+            }
+            let exp = expansions[j];
+            let mut elen = 0;
+            while elen < 127 && exp[elen] != 0 {
+                elen += 1;
+            }
+            unsafe {
+                G_EXPANDED_ARGS[n_args] = exp;
+                G_ARGS[n_args] = &G_EXPANDED_ARGS[n_args][..elen];
+            }
+            n_args += 1;
+        }
+        if n_args >= 32 {
+            break;
+        }
+    }
+
+    dispatch(unsafe { &G_ARGS[..n_args] });
+}
+
+// ── Shebang check ──────────────────────────────────────────────────────
+
+/// Read the first line of a binary and check for `#!` shebang.
+/// Returns the interpreter path (NUL-terminated), or None.
+fn check_shebang(path: *const u8) -> Option<[u8; 256]> {
+    let fd = unsafe { syscalls::open(path, syscalls::O_RDONLY as u64, 0) };
+    if fd < 0 {
+        return None;
+    }
+
+    let mut buf = [0u8; 256];
+    let mut pos = 0usize;
+    loop {
+        let mut c = [0u8; 1];
+        let n = unsafe { syscalls::read_fd(fd as u64, c.as_mut_ptr(), 1) };
+        if n <= 0 || c[0] == b'\n' || pos >= 255 {
+            break;
+        }
+        buf[pos] = c[0];
+        pos += 1;
+    }
+    unsafe {
+        syscalls::close(fd as u64);
+    }
+
+    if pos < 2 || buf[0] != b'#' || buf[1] != b'!' {
+        return None;
+    }
+
+    // Skip "#!" and whitespace to find interpreter path.
+    let mut start = 2;
+    while start < pos && (buf[start] == b' ' || buf[start] == b'\t') {
+        start += 1;
+    }
+    let mut end = start;
+    while end < pos && buf[end] != b' ' && buf[end] != b'\t' {
+        end += 1;
+    }
+
+    if start >= end {
+        return None;
+    }
+
+    let mut result = [0u8; 256];
+    let n = (end - start).min(255);
+    for i in 0..n {
+        result[i] = buf[start + i];
+    }
+    Some(result)
 }
