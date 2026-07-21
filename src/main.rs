@@ -11,7 +11,12 @@
 
 #![no_std]
 #![no_main]
-#![allow(unsafe_op_in_unsafe_fn, non_snake_case, clippy::missing_safety_doc, static_mut_refs)]
+#![allow(
+    unsafe_op_in_unsafe_fn,
+    non_snake_case,
+    clippy::missing_safety_doc,
+    static_mut_refs
+)]
 
 use core::arch::asm;
 
@@ -39,6 +44,8 @@ static mut G_TOKEN_OFFSETS: [(usize, usize); 16] = [(0usize, 0usize); 16];
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     syscalls::write(1, VERSION_BANNER.as_ptr(), VERSION_BANNER.len());
+
+    features::env_init();
 
     // Try to enable raw terminal mode for tab completion + arrow history.
     // If the kernel doesn't support TIOCSRAW (returns ENOSYS), we fall
@@ -91,7 +98,8 @@ unsafe fn raw_mode_repl() -> ! {
                 if b == 0x1B && i + 2 < n {
                     if rx_buf[i + 1] == b'[' {
                         match rx_buf[i + 2] {
-                            b'A' => { // Up — history previous
+                            b'A' => {
+                                // Up — history previous
                                 if let Some(entry) = features::nav_up() {
                                     // Clear current line, replace with entry.
                                     clear_line(&line[..line_len], cursor);
@@ -106,7 +114,8 @@ unsafe fn raw_mode_repl() -> ! {
                                 i += 3;
                                 continue;
                             }
-                            b'B' => { // Down — history next
+                            b'B' => {
+                                // Down — history next
                                 match features::nav_down() {
                                     Some(entry) => {
                                         clear_line(&line[..line_len], cursor);
@@ -128,7 +137,8 @@ unsafe fn raw_mode_repl() -> ! {
                                 i += 3;
                                 continue;
                             }
-                            b'C' => { // Right — move cursor right (TODO)
+                            b'C' => {
+                                // Right — move cursor right (TODO)
                                 if cursor < line_len {
                                     cursor += 1;
                                     // Move cursor right: ESC [ C
@@ -137,7 +147,8 @@ unsafe fn raw_mode_repl() -> ! {
                                 i += 3;
                                 continue;
                             }
-                            b'D' => { // Left — move cursor left
+                            b'D' => {
+                                // Left — move cursor left
                                 if cursor > 0 {
                                     cursor -= 1;
                                     syscalls::write(1, b"\x1B[D".as_ptr(), 3);
@@ -269,6 +280,10 @@ unsafe fn raw_mode_repl() -> ! {
 
         // History expansion.
         let expanded = features::history_expand(&line[..line_len]);
+        // Tilde expansion (must come before variable expansion).
+        let expanded = features::expand_tilde(expanded.as_slice());
+        // Variable expansion ($VAR / ${VAR}).
+        let expanded = features::expand_vars(expanded.as_slice());
         let expanded_slice = expanded.as_slice();
 
         // Check for pipe/redirect.
@@ -365,6 +380,8 @@ unsafe fn cooked_mode_repl() -> ! {
 
         let raw = &G_LINE[..end];
         let expanded = features::history_expand(raw);
+        let expanded = features::expand_tilde(expanded.as_slice());
+        let expanded = features::expand_vars(expanded.as_slice());
         let expanded_slice = expanded.as_slice();
         features::history_push(expanded_slice);
 

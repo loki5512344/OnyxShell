@@ -486,7 +486,238 @@ impl Vec<u8> {
     }
 }
 
+// ── Environment variables ──────────────────────────────────────────────
+//
+// Simple flat array of (key, value) pairs. Max 32 entries, key ≤ 64 bytes,
+// value ≤ 128 bytes. Lookup is O(N) — fine for interactive use.
+
+pub const ENV_MAX: usize = 32;
+pub const ENV_KEY_MAX: usize = 64;
+pub const ENV_VAL_MAX: usize = 128;
+
+static mut G_ENV_KEYS: [[u8; ENV_KEY_MAX]; ENV_MAX] = [[0; ENV_KEY_MAX]; ENV_MAX];
+static mut G_ENV_KEY_LEN: [u8; ENV_MAX] = [0; ENV_MAX];
+static mut G_ENV_VALS: [[u8; ENV_VAL_MAX]; ENV_MAX] = [[0; ENV_VAL_MAX]; ENV_MAX];
+static mut G_ENV_VAL_LEN: [u8; ENV_MAX] = [0; ENV_MAX];
+static mut G_ENV_COUNT: usize = 0;
+
+/// Initialise default environment (HOME and PATH).
+pub unsafe fn env_init() {
+    // These are the fallback values before the init process sets them.
+    env_set(b"HOME", b"/users/root");
+    env_set(b"PATH", b"/bin");
+}
+
+/// Look up a variable by name. Returns `None` if not found.
+pub unsafe fn env_get(key: &[u8]) -> Option<&'static [u8]> {
+    for i in 0..G_ENV_COUNT {
+        let klen = G_ENV_KEY_LEN[i] as usize;
+        if &G_ENV_KEYS[i][..klen] == key {
+            let vlen = G_ENV_VAL_LEN[i] as usize;
+            return Some(&G_ENV_VALS[i][..vlen]);
+        }
+    }
+    None
+}
+
+/// Set (or update) a variable. If the key is empty or storage is full
+/// the call is silently ignored.
+pub unsafe fn env_set(key: &[u8], val: &[u8]) {
+    if key.is_empty() {
+        return;
+    }
+    let kn = key.len().min(ENV_KEY_MAX - 1);
+    let vn = val.len().min(ENV_VAL_MAX - 1);
+
+    // Update existing entry.
+    for i in 0..G_ENV_COUNT {
+        let klen = G_ENV_KEY_LEN[i] as usize;
+        if &G_ENV_KEYS[i][..klen] == key {
+            for j in 0..vn {
+                G_ENV_VALS[i][j] = val[j];
+            }
+            G_ENV_VALS[i][vn] = 0;
+            G_ENV_VAL_LEN[i] = vn as u8;
+            return;
+        }
+    }
+
+    // Add new entry.
+    if G_ENV_COUNT >= ENV_MAX {
+        return;
+    }
+    let slot = G_ENV_COUNT;
+    for j in 0..kn {
+        G_ENV_KEYS[slot][j] = key[j];
+    }
+    G_ENV_KEYS[slot][kn] = 0;
+    G_ENV_KEY_LEN[slot] = kn as u8;
+    for j in 0..vn {
+        G_ENV_VALS[slot][j] = val[j];
+    }
+    G_ENV_VALS[slot][vn] = 0;
+    G_ENV_VAL_LEN[slot] = vn as u8;
+    G_ENV_COUNT += 1;
+}
+
+/// Remove a variable. No-op if the key does not exist.
+pub unsafe fn env_unset(key: &[u8]) {
+    for i in 0..G_ENV_COUNT {
+        let klen = G_ENV_KEY_LEN[i] as usize;
+        if &G_ENV_KEYS[i][..klen] == key {
+            // Shift remaining entries left to fill the hole.
+            for j in i..G_ENV_COUNT - 1 {
+                G_ENV_KEYS[j] = G_ENV_KEYS[j + 1];
+                G_ENV_KEY_LEN[j] = G_ENV_KEY_LEN[j + 1];
+                G_ENV_VALS[j] = G_ENV_VALS[j + 1];
+                G_ENV_VAL_LEN[j] = G_ENV_VAL_LEN[j + 1];
+            }
+            G_ENV_COUNT -= 1;
+            return;
+        }
+    }
+}
+
+/// Print every stored variable as `KEY=VALUE`, one per line.
+pub unsafe fn env_list() {
+    for i in 0..G_ENV_COUNT {
+        let klen = G_ENV_KEY_LEN[i] as usize;
+        let vlen = G_ENV_VAL_LEN[i] as usize;
+        io::write_raw(&G_ENV_KEYS[i][..klen]);
+        io::write_raw(b"=");
+        io::write_raw(&G_ENV_VALS[i][..vlen]);
+        io::newline();
+    }
+}
+
+/// Build a NULL-terminated `envp` array for `execve`. Each entry is a
+/// NUL-terminated `KEY=VALUE` string.  Returns the number of entries
+/// written (the pointer array is terminated by an extra NULL).
+pub unsafe fn build_envp(
+    strings: &mut [[u8; ENV_KEY_MAX + ENV_VAL_MAX + 2]; ENV_MAX],
+    ptrs: &mut [u64; ENV_MAX + 1],
+) -> usize {
+    let mut count = 0;
+    for i in 0..G_ENV_COUNT {
+        let klen = G_ENV_KEY_LEN[i] as usize;
+        let vlen = G_ENV_VAL_LEN[i] as usize;
+        let mut pos = 0;
+        for j in 0..klen {
+            strings[count][pos] = G_ENV_KEYS[i][j];
+            pos += 1;
+        }
+        strings[count][pos] = b'=';
+        pos += 1;
+        for j in 0..vlen {
+            strings[count][pos] = G_ENV_VALS[i][j];
+            pos += 1;
+        }
+        strings[count][pos] = 0;
+        ptrs[count] = strings[count].as_ptr() as u64;
+        count += 1;
+    }
+    ptrs[count] = 0;
+    count
+}
+
+// ── Variable expansion (`$VAR` / `${VAR}`) ────────────────────────────
+
+/// Expand `$VAR` and `${VAR}` references inside a line.
+/// Undefined variables expand to the empty string (POSIX behaviour).
+pub unsafe fn expand_vars(line: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] == b'$' && i + 1 < line.len() {
+            let next = line[i + 1];
+            if next == b'{' {
+                // ${VAR} — read until closing '}'.
+                let mut j = i + 2;
+                while j < line.len() && line[j] != b'}' {
+                    j += 1;
+                }
+                if j < line.len() {
+                    let varname = &line[i + 2..j];
+                    if let Some(val) = env_get(varname) {
+                        out.extend_from_slice(val);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            } else if (next >= b'A' && next <= b'Z')
+                || (next >= b'a' && next <= b'z')
+                || next == b'_'
+            {
+                // $VAR — consume alphanumeric / underscore characters.
+                let mut j = i + 1;
+                while j < line.len()
+                    && ((line[j] >= b'A' && line[j] <= b'Z')
+                        || (line[j] >= b'a' && line[j] <= b'z')
+                        || (line[j] >= b'0' && line[j] <= b'9')
+                        || line[j] == b'_')
+                {
+                    j += 1;
+                }
+                let varname = &line[i + 1..j];
+                if let Some(val) = env_get(varname) {
+                    out.extend_from_slice(val);
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push(line[i]);
+        i += 1;
+    }
+    out
+}
+
+// ── Tilde expansion (`~` / `~user`) ──────────────────────────────────
+
+/// Expand `~` → value of `$HOME` (or `/users/root`), and
+/// `~user` → `/users/user/`.  Tilde is only recognised when it appears
+/// at the start of a word (i.e.  beginning of line or after whitespace).
+pub unsafe fn expand_tilde(line: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] == b'~' && (i == 0 || line[i - 1] == b' ' || line[i - 1] == b'\t') {
+            let mut j = i + 1;
+            while j < line.len() && line[j] != b'/' && !io::is_whitespace(line[j]) {
+                j += 1;
+            }
+            if j == i + 1 {
+                // "~" alone — use HOME.
+                if let Some(home) = env_get(b"HOME") {
+                    out.extend_from_slice(home);
+                } else {
+                    out.extend_from_slice(b"/users/root");
+                }
+            } else {
+                // "~username" — assume /users/<name>.
+                out.extend_from_slice(b"/users/");
+                out.extend_from_slice(&line[i + 1..j]);
+            }
+            i = j;
+            continue;
+        }
+        out.push(line[i]);
+        i += 1;
+    }
+    out
+}
+
 // ── Tab completion ─────────────────────────────────────────────────────
+//
+// When the user presses Tab, the shell calls tab_complete() with the
+// current line buffer and cursor position. The function:
+//   1. Finds the token under the cursor.
+//   2. If it's the first word, matches against built-in command names.
+//   3. Always matches against filesystem entries in the token's directory.
+//   4. If one match: fills in the full name + trailing space.
+//   5. If multiple matches: fills in the common prefix; if no new prefix,
+//      prints all matches.
+//   6. Returns the new line contents and new cursor position.
 //
 // When the user presses Tab, the shell calls tab_complete() with the
 // current line buffer and cursor position. The function:
@@ -500,11 +731,10 @@ impl Vec<u8> {
 
 /// Built-in command names for tab completion of the first word.
 const BUILTINS: &[&[u8]] = &[
-    b"ls", b"cat", b"cp", b"mv", b"rm", b"mkdir", b"touch", b"stat",
-    b"cd", b"pwd", b"echo", b"whoami", b"uname", b"date", b"clear",
-    b"help", b"exit", b"exec", b"run", b"ver",
+    b"ls", b"cat", b"cp", b"mv", b"rm", b"mkdir", b"touch", b"stat", b"cd", b"pwd", b"echo",
+    b"whoami", b"uname", b"date", b"clear", b"help", b"exit", b"exec", b"run", b"ver", b"export",
+    b"set", b"unset",
 ];
-
 /// Result of a tab completion attempt.
 pub struct TabResult {
     /// New line contents (may be unchanged if no matches).

@@ -70,7 +70,9 @@ pub fn resolve(input: &[u8], out: &mut [u8; PATH_MAX]) -> usize {
 
     // Add separator if cwd doesn't end with '/'.
     if jlen > 0 && joined[jlen - 1] != b'/' {
-        if jlen >= PATH_MAX - 1 { return 0; }
+        if jlen >= PATH_MAX - 1 {
+            return 0;
+        }
         joined[jlen] = b'/';
         jlen += 1;
     }
@@ -136,11 +138,15 @@ fn normalize(path: &[u8], out: &mut [u8; PATH_MAX]) -> usize {
             // Ensure there's a '/' separator (unless we're at root and
             // out already ends with '/').
             if olen > 0 && out[olen - 1] != b'/' {
-                if olen >= PATH_MAX - 1 { return 0; }
+                if olen >= PATH_MAX - 1 {
+                    return 0;
+                }
                 out[olen] = b'/';
                 olen += 1;
             }
-            if olen + comp.len() >= PATH_MAX { return 0; }
+            if olen + comp.len() >= PATH_MAX {
+                return 0;
+            }
             out[olen..olen + comp.len()].copy_from_slice(comp);
             olen += comp.len();
         }

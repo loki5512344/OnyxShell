@@ -147,7 +147,11 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
             G_OUT_PATH[j] = line[off + j];
         }
         G_OUT_PATH[n] = 0;
-        syscalls::open(G_OUT_PATH.as_ptr(), (syscalls::O_WRONLY | syscalls::O_CREAT | syscalls::O_TRUNC) as u64, 0)
+        syscalls::open(
+            G_OUT_PATH.as_ptr(),
+            (syscalls::O_WRONLY | syscalls::O_CREAT | syscalls::O_TRUNC) as u64,
+            0,
+        )
     } else {
         1 // stdout
     };

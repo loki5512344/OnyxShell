@@ -10,6 +10,7 @@
 //! work out of the box. For regular users, these commands print
 //! "Permission denied".
 
+use crate::features;
 use crate::io;
 use crate::path;
 use crate::syscalls;
@@ -29,6 +30,12 @@ pub fn dispatch(args: &[&[u8]]) {
         cmd_help(rest);
     } else if cmd == b"echo" {
         cmd_echo(rest);
+    } else if cmd == b"export" {
+        cmd_export(rest);
+    } else if cmd == b"set" {
+        cmd_set(rest);
+    } else if cmd == b"unset" {
+        cmd_unset(rest);
     } else if cmd == b"pwd" {
         cmd_pwd(rest);
     } else if cmd == b"cd" {
@@ -93,6 +100,9 @@ fn cmd_help(_args: &[&[u8]]) {
     io::write_line("");
     io::write_line("System:");
     io::write_line("  echo [text]      print text");
+    io::write_line("  export [VAR=val] set environment variable");
+    io::write_line("  set              list environment variables");
+    io::write_line("  unset VAR        remove environment variable");
     io::write_line("  whoami           show current user and ring");
     io::write_line("  uname            show system information");
     io::write_line("  date             show current time");
@@ -117,6 +127,48 @@ fn cmd_echo(args: &[&[u8]]) {
         io::write_raw(a);
     }
     io::newline();
+}
+
+// ─── export ──────────────────────────────────────────────────────────────
+
+fn cmd_export(args: &[&[u8]]) {
+    if args.is_empty() {
+        unsafe {
+            features::env_list();
+        }
+        return;
+    }
+    for a in args {
+        if let Some(eq) = a.iter().position(|&b| b == b'=') {
+            let key = &a[..eq];
+            let val = &a[eq + 1..];
+            if !key.is_empty() {
+                unsafe {
+                    features::env_set(key, val);
+                }
+            }
+        }
+        // `export VAR` (without =value) is accepted but is a no-op —
+        // all our variables are "exported" by default.
+    }
+}
+
+// ─── set ─────────────────────────────────────────────────────────────────
+
+fn cmd_set(_args: &[&[u8]]) {
+    unsafe {
+        features::env_list();
+    }
+}
+
+// ─── unset ───────────────────────────────────────────────────────────────
+
+fn cmd_unset(args: &[&[u8]]) {
+    for a in args {
+        unsafe {
+            features::env_unset(a);
+        }
+    }
 }
 
 // ─── pwd ─────────────────────────────────────────────────────────────────
@@ -733,6 +785,65 @@ fn cmd_ver(_args: &[&[u8]]) {
     io::write_line("License: GPL-3.0-or-later");
 }
 
+// ── PATH search helper ──────────────────────────────────────────────────
+
+/// Search `$PATH` for a command that has no `/` in its name.
+/// Returns an absolute NUL-terminated path if found.
+fn search_path(cmd: &[u8]) -> Option<[u8; path::PATH_MAX]> {
+    if cmd.contains(&b'/') {
+        return None;
+    }
+    unsafe {
+        let path_var = features::env_get(b"PATH")?;
+        let mut i = 0;
+        while i < path_var.len() {
+            let start = i;
+            while i < path_var.len() && path_var[i] != b':' {
+                i += 1;
+            }
+            let dir = &path_var[start..i];
+            if !dir.is_empty() {
+                let mut abs_dir = [0u8; path::PATH_MAX];
+                let dlen = path::resolve(dir, &mut abs_dir);
+                if dlen > 0 {
+                    let mut full = [0u8; path::PATH_MAX];
+                    let mut pos = 0;
+                    for &b in &abs_dir[..dlen] {
+                        if pos >= path::PATH_MAX - 1 {
+                            break;
+                        }
+                        full[pos] = b;
+                        pos += 1;
+                    }
+                    if pos > 0 && full[pos - 1] != b'/' {
+                        if pos >= path::PATH_MAX - 1 {
+                            break;
+                        }
+                        full[pos] = b'/';
+                        pos += 1;
+                    }
+                    for &b in cmd {
+                        if pos >= path::PATH_MAX - 1 {
+                            break;
+                        }
+                        full[pos] = b;
+                        pos += 1;
+                    }
+                    full[pos] = 0;
+                    let mut st = [0u8; 256];
+                    if syscalls::stat(full.as_ptr(), st.as_mut_ptr()) >= 0 {
+                        return Some(full);
+                    }
+                }
+            }
+            if i < path_var.len() && path_var[i] == b':' {
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 // ─── exec ────────────────────────────────────────────────────────────────
 
 /// exec <path> [args] — replace the current shell process with a binary.
@@ -743,18 +854,23 @@ fn cmd_exec(args: &[&[u8]]) {
     }
 
     let mut path_buf = [0u8; path::PATH_MAX];
-    let len = path::resolve(args[0], &mut path_buf);
+    let len = if args[0].contains(&b'/') {
+        path::resolve(args[0], &mut path_buf)
+    } else if let Some(found) = search_path(args[0]) {
+        let flen = found.iter().position(|&b| b == 0).unwrap_or(path::PATH_MAX);
+        path_buf[..flen].copy_from_slice(&found[..flen]);
+        flen
+    } else {
+        path::resolve(args[0], &mut path_buf)
+    };
     if len == 0 {
         io::write_error("exec: path too long");
         return;
     }
 
     // Build argv: array of pointers to NUL-terminated strings.
-    // We need to store the argument strings somewhere persistent.
-    // Since exec replaces the process, we can use stack buffers.
     let mut argv_strs: [[u8; path::PATH_MAX]; MAX_ARGS] = [[0; path::PATH_MAX]; MAX_ARGS];
     let mut argv_ptrs = [0u64; MAX_ARGS + 1];
-
     let argc = args.len().min(MAX_ARGS);
     for i in 0..argc {
         let arg = args[i];
@@ -766,10 +882,16 @@ fn cmd_exec(args: &[&[u8]]) {
         argv_strs[i][arg.len()] = 0;
         argv_ptrs[i] = argv_strs[i].as_ptr() as u64;
     }
-    argv_ptrs[argc] = 0; // NULL terminator.
+    argv_ptrs[argc] = 0;
 
-    let ret = unsafe { syscalls::exec(path_buf.as_ptr(), argv_ptrs.as_ptr()) };
-    // If exec returns, it failed.
+    // Build envp from the current environment.
+    let mut envp_strs =
+        [[0u8; features::ENV_KEY_MAX + features::ENV_VAL_MAX + 2]; features::ENV_MAX];
+    let mut envp_ptrs = [0u64; features::ENV_MAX + 1];
+    let _n_env = unsafe { features::build_envp(&mut envp_strs, &mut envp_ptrs) };
+
+    let ret =
+        unsafe { syscalls::execve(path_buf.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
     io::write_error_errno("exec", ret);
 }
 
@@ -784,7 +906,15 @@ fn cmd_run(args: &[&[u8]]) {
     }
 
     let mut path_buf = [0u8; path::PATH_MAX];
-    let len = path::resolve(args[0], &mut path_buf);
+    let len = if args[0].contains(&b'/') {
+        path::resolve(args[0], &mut path_buf)
+    } else if let Some(found) = search_path(args[0]) {
+        let flen = found.iter().position(|&b| b == 0).unwrap_or(path::PATH_MAX);
+        path_buf[..flen].copy_from_slice(&found[..flen]);
+        flen
+    } else {
+        path::resolve(args[0], &mut path_buf)
+    };
     if len == 0 {
         io::write_error("run: path too long");
         return;
@@ -793,7 +923,6 @@ fn cmd_run(args: &[&[u8]]) {
     // Build argv.
     let mut argv_strs: [[u8; path::PATH_MAX]; MAX_ARGS] = [[0; path::PATH_MAX]; MAX_ARGS];
     let mut argv_ptrs = [0u64; MAX_ARGS + 1];
-
     let argc = args.len().min(MAX_ARGS);
     for i in 0..argc {
         let arg = args[i];
