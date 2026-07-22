@@ -103,8 +103,16 @@ unsafe fn raw_mode_repl() -> ! {
 
         'line_loop: loop {
             let n = syscalls::read(0, rx_buf.as_mut_ptr(), rx_buf.len() as u64);
-            if n <= 0 {
+            // Audit fix (🟢 #10): busy-loop on EOF. The previous code
+            // did `if n <= 0 { continue; }` — a closed stdin would spin
+            // at 100% CPU forever. We now yield the hart on transient
+            // 0-byte reads and exit cleanly on a hard EOF (n < 0).
+            if n == 0 {
+                syscalls::yield_cpu();
                 continue;
+            }
+            if n < 0 {
+                syscalls::exit(0);
             }
             let n = n as usize;
             let mut i = 0;
@@ -295,20 +303,44 @@ unsafe fn raw_mode_repl() -> ! {
         // Push to history BEFORE expansion (so !! works).
         features::history_push(&line[..line_len]);
 
-        // History expansion.
+        // Audit fix (🔴 #9): detect shell operators (`|`, `>`, `<`) in
+        // the RAW line BEFORE variable expansion. The previous code
+        // ran `expand_vars` first, so `export X='> /etc/motd'; echo $X`
+        // would actually redirect — a shell-injection primitive. We
+        // now route any line containing these operators through the
+        // pipeline parser, which splits on `|`/`>`/`<` at the raw
+        // level; variable expansion is then applied per-segment by
+        // the dispatch path inside `commands::dispatch`.
+        let has_pipe_or_redirect_raw = line[..line_len]
+            .iter()
+            .any(|&b| b == b'|' || b == b'>' || b == b'<');
+        if has_pipe_or_redirect_raw {
+            static mut G_RAW: [u8; LINE_MAX] = [0u8; LINE_MAX];
+            let n = line_len.min(LINE_MAX - 1);
+            for j in 0..n {
+                G_RAW[j] = line[j];
+            }
+            G_RAW[n] = 0;
+            let p = pipeline::parse(&G_RAW[..n]);
+            pipeline::execute(&G_RAW[..n], &p);
+            continue;
+        }
+
+        // No operators in the raw line — safe to expand. History
+        // expansion is still applied to the raw line (so `!!` works),
+        // but the result is then checked AGAIN for operators that
+        // came out of history expansion (`!N` could pull in a line
+        // that had a `|`). If any operator appears post-expansion,
+        // route through the pipeline parser on the expanded buffer.
         let expanded = features::history_expand(&line[..line_len]);
-        // Tilde expansion (must come before variable expansion).
         let expanded = features::expand_tilde(expanded.as_slice());
-        // Variable expansion ($VAR / ${VAR}).
         let expanded = features::expand_vars(expanded.as_slice());
         let expanded_slice = expanded.as_slice();
 
-        // Check for pipe/redirect.
         let has_pipe_or_redirect = expanded_slice
             .iter()
             .any(|&b| b == b'|' || b == b'>' || b == b'<');
         if has_pipe_or_redirect {
-            // Copy to static buffer for pipeline.
             static mut G_EXPANDED: [u8; LINE_MAX] = [0u8; LINE_MAX];
             let n = expanded_slice.len().min(LINE_MAX - 1);
             for j in 0..n {
@@ -396,8 +428,32 @@ unsafe fn cooked_mode_repl() -> ! {
         }
 
         let raw = &G_LINE[..end];
-        let expanded = features::history_expand(raw);
-        let expanded = features::expand_tilde(expanded.as_slice());
+
+        // Audit fix (🔴 #9): detect shell operators in the RAW line
+        // BEFORE variable expansion (see raw_mode_repl for full
+        // rationale). History expansion is also applied to the raw
+        // line so `!!` works; if history expansion introduces an
+        // operator, we route through the pipeline parser on the
+        // expanded buffer.
+        let hist_expanded = features::history_expand(raw);
+        let has_pipe_or_redirect_raw = hist_expanded
+            .as_slice()
+            .iter()
+            .any(|&b| b == b'|' || b == b'>' || b == b'<');
+        if has_pipe_or_redirect_raw {
+            static mut G_HIST: [u8; LINE_MAX] = [0u8; LINE_MAX];
+            let n = hist_expanded.as_slice().len().min(LINE_MAX - 1);
+            for j in 0..n {
+                G_HIST[j] = hist_expanded.as_slice()[j];
+            }
+            G_HIST[n] = 0;
+            features::history_push(&G_HIST[..n]);
+            let p = pipeline::parse(&G_HIST[..n]);
+            pipeline::execute(&G_HIST[..n], &p);
+            continue;
+        }
+
+        let expanded = features::expand_tilde(hist_expanded.as_slice());
         let expanded = features::expand_vars(expanded.as_slice());
         let expanded_slice = expanded.as_slice();
         features::history_push(expanded_slice);
@@ -451,13 +507,18 @@ unsafe fn cooked_mode_repl() -> ! {
     }
 }
 
-/// Panic handler — print a message and halt.
+/// Panic handler — print a message and exit.
+///
+/// Audit fix (🟢 #7): the previous handler dropped into a `wfi` loop,
+/// which froze the shell forever with the terminal still in raw mode.
+/// We now restore cooked mode (so the parent gets a usable terminal
+/// back) and exit with code 101 — the conventional Rust panic exit
+/// code, recognizable by service supervisors.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe {
+        let _ = syscalls::disable_raw_mode();
         io::write_str("osh: internal panic — halting\n");
-        loop {
-            asm!("wfi");
-        }
+        syscalls::exit(101);
     }
 }

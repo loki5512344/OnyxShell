@@ -474,10 +474,16 @@ fn cmd_mkdir(args: &[&[u8]]) {
 
 // ─── cp ──────────────────────────────────────────────────────────────────
 
-fn cmd_cp(args: &[&[u8]]) {
+/// Audit fix (🔴 #7): `cmd_cp` now returns `bool` (true on success,
+/// false on any error). The previous version was `fn(...) -> ()` —
+/// errors were only printed, which meant `cmd_mv` could not tell
+/// whether the copy succeeded before unlinking the source, leading
+/// to data loss when the destination disk was full or the kernel
+/// returned EPERM.
+fn cmd_cp(args: &[&[u8]]) -> bool {
     if args.len() < 2 {
         io::write_error("cp: missing operand (usage: cp <src> <dst>)");
-        return;
+        return false;
     }
 
     let src_in = args[0];
@@ -489,43 +495,49 @@ fn cmd_cp(args: &[&[u8]]) {
     let dlen = path::resolve(dst_in, &mut dst_abs);
     if slen == 0 || dlen == 0 {
         io::write_error("cp: path too long");
-        return;
+        return false;
     }
 
     // Open source for reading.
     let src_fd = unsafe { syscalls::open(src_abs.as_ptr(), syscalls::O_RDONLY as u64, 0) };
     if src_fd < 0 {
         io::write_error_errno("cp", src_fd);
-        return;
+        return false;
     }
 
     // Create destination file using SYS_create (root-only).
-    // create() returns a writable fd token directly — no need to re-open.
     let dst_fd = unsafe { syscalls::create(dst_abs.as_ptr(), 0, 0) };
     if dst_fd < 0 {
         io::write_error_errno("cp: cannot create destination", dst_fd);
         unsafe {
             syscalls::close(src_fd as u64);
         }
-        return;
+        return false;
     }
 
     // Copy data from source to destination.
-    copy_loop(src_fd as u64, dst_fd as u64);
+    let copy_ok = copy_loop(src_fd as u64, dst_fd as u64);
 
     unsafe {
         syscalls::close(dst_fd as u64);
         syscalls::close(src_fd as u64);
     }
+    copy_ok
 }
 
 /// Copy data from `src_fd` to `dst_fd` in 512-byte chunks.
-fn copy_loop(src_fd: u64, dst_fd: u64) {
+/// Returns true on success, false if a read or write error occurred.
+/// (Audit fix 🔴 #7: was `fn(...) -> ()`.)
+fn copy_loop(src_fd: u64, dst_fd: u64) -> bool {
     let mut buf = [0u8; 512];
     loop {
         let n = unsafe { syscalls::read_fd(src_fd, buf.as_mut_ptr(), buf.len() as u64) };
-        if n <= 0 {
-            break;
+        if n < 0 {
+            io::write_error("cp: read error");
+            return false;
+        }
+        if n == 0 {
+            return true;
         }
         let n = n as usize;
         let mut written = 0usize;
@@ -533,7 +545,7 @@ fn copy_loop(src_fd: u64, dst_fd: u64) {
             let w = unsafe { syscalls::write_fd(dst_fd, buf[written..].as_ptr(), n - written) };
             if w <= 0 {
                 io::write_error("cp: write error");
-                return;
+                return false;
             }
             written += w as usize;
         }
@@ -569,11 +581,16 @@ fn cmd_mv(args: &[&[u8]]) {
     // If rename failed, fall back to cp + rm.
     // (Common case: cross-directory rename may not be supported by OnyxFS.)
     io::write_raw(b"osh: mv: rename failed, falling back to copy+remove\n");
-    cmd_cp(args);
-    // Only remove source if the copy succeeded (cp prints its own errors).
-    let rm_ret = unsafe { syscalls::unlink(src_abs.as_ptr()) };
-    if rm_ret < 0 {
-        io::write_error_errno("mv: cannot remove source", rm_ret);
+    // Audit fix (🔴 #7): only unlink the source if the copy actually
+    // succeeded. The previous code unconditionally unlinked, which
+    // meant a disk-full or EPERM during copy would lose the source.
+    if cmd_cp(args) {
+        let rm_ret = unsafe { syscalls::unlink(src_abs.as_ptr()) };
+        if rm_ret < 0 {
+            io::write_error_errno("mv: cannot remove source", rm_ret);
+        }
+    } else {
+        io::write_error("mv: copy failed, source preserved");
     }
 }
 
@@ -1146,12 +1163,23 @@ fn cmd_bg(args: &[&[u8]]) {
 }
 
 /// Parse a job specifier like `%1` → 1. Returns 0 on invalid input.
+///
+/// Audit fix (🟢 #6): use checked arithmetic. The previous
+/// `id = id * 10 + (b - b'0') as usize` would overflow `usize` on an
+/// input like `%99999999999999999`, which is a debug-build panic (and
+/// a silent wrap in release).
 fn parse_job_id(arg: &[u8]) -> usize {
     if arg.len() > 1 && arg[0] == b'%' {
         let mut id = 0usize;
         for &b in &arg[1..] {
             if b >= b'0' && b <= b'9' {
-                id = id * 10 + (b - b'0') as usize;
+                id = match id
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add((b - b'0') as usize))
+                {
+                    Some(v) => v,
+                    None => return 0,
+                };
             } else {
                 return 0;
             }
@@ -1164,6 +1192,13 @@ fn parse_job_id(arg: &[u8]) -> usize {
 
 // ─── source ──────────────────────────────────────────────────────────────
 
+/// Audit fix (🟢 #12): cap recursive `source` / `.` depth. The previous
+/// implementation followed `source /self.osh` (or any cyclic include)
+/// until the kernel stack overflowed. We now refuse to nest deeper than
+/// `SCRIPT_DEPTH_MAX` levels.
+const SCRIPT_DEPTH_MAX: u8 = 8;
+static mut SCRIPT_DEPTH: u8 = 0;
+
 fn cmd_source(args: &[&[u8]]) {
     if args.is_empty() {
         io::write_error("source: missing file operand (try 'help')");
@@ -1175,6 +1210,23 @@ fn cmd_source(args: &[&[u8]]) {
 /// Execute a script file: open, read lines, dispatch each.
 /// Used by `source`, batch mode, and `#!/bin/osh` shebang handling.
 pub fn do_script(input: &[u8]) {
+    // Audit fix (🟢 #12): refuse to nest deeper than SCRIPT_DEPTH_MAX.
+    // This prevents `source /self.osh` from overflowing the kernel stack.
+    unsafe {
+        if SCRIPT_DEPTH >= SCRIPT_DEPTH_MAX {
+            io::write_error("source: max recursion depth exceeded");
+            return;
+        }
+        SCRIPT_DEPTH += 1;
+    }
+    let result = do_script_inner(input);
+    unsafe {
+        SCRIPT_DEPTH -= 1;
+    }
+    result
+}
+
+fn do_script_inner(input: &[u8]) {
     let mut abs = [0u8; path::PATH_MAX];
     let len = path::resolve(input, &mut abs);
     if len == 0 {

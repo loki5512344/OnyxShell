@@ -258,8 +258,26 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
     }
 
     // Fork for each segment. Each child wires its stdin/stdout and execs.
+    //
+    // Audit fix (🔴 #10): the previous loop forked segment N, then
+    // `waitpid`-ed for it BEFORE forking segment N+1. For a pipeline
+    // like `cat bigfile | cat`, the first child would block writing
+    // to the pipe once the kernel's pipe buffer filled up — but the
+    // reader (segment 1) hadn't been forked yet, so the buffer never
+    // drained. Classic deadlock. We now split into two passes:
+    //   1. fork ALL segments, recording their pids and the fds the
+    //      parent still needs to close;
+    //   2. close the parent's copies of all pipe fds (so EOF can
+    //      propagate to the last reader);
+    //   3. waitpid each child in order.
     let mut prev_read_fd: i64 = stdin_fd; // start from redirect stdin (or 0)
     let mut last_pid: i64 = 0;
+    let mut spawned_pids: [i64; MAX_SEGMENTS] = [0i64; MAX_SEGMENTS];
+    let mut spawned_count: usize = 0;
+    let mut parent_close_after_fork: [(i64, bool); MAX_SEGMENTS] = [(-1, false); MAX_SEGMENTS];
+    // ^ (fd, is_write_end) — collected so the parent can close them all
+    //   AFTER every fork has happened. Without this, the last reader
+    //   never sees EOF because the parent still holds the write end.
     for seg_idx in 0..p.n_segments {
         let seg = &p.segments[seg_idx];
         if seg.n_args == 0 {
@@ -295,13 +313,7 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
         }
         if pid == 0 {
             // Child: wire stdin/stdout, then exec or run built-in.
-            // (We can't easily redirect fd 0/1 without dup2, so we pass
-            // the explicit fds to a built-in runner. For external binaries
-            // we'd need dup2 — not yet available. For now, built-ins only.)
             if cur_read_fd != 0 {
-                // Best effort: dup the read end onto fd 0. dup() returns a
-                // new fd, doesn't replace — we'd need dup2 for that. So we
-                // just close 0 and hope the exec inherits the fd table.
                 syscalls::close(0);
                 let _ = syscalls::dup(cur_read_fd as u64);
             }
@@ -325,19 +337,44 @@ pub unsafe fn execute(line: &[u8], p: &Pipeline) {
             // Exit the child.
             syscalls::exit(0);
         }
-        // Parent: close the fds we don't need anymore.
-        if cur_read_fd > 2 && cur_read_fd != stdin_fd {
-            syscalls::close(cur_read_fd as u64);
-        }
-        if cur_write_fd > 2 && cur_write_fd != stdout_fd {
-            syscalls::close(cur_write_fd as u64);
-        }
+        // Parent: remember the fds to close AFTER all forks are done,
+        // and remember the pid for the wait phase. We deliberately do
+        // NOT waitpid here — that was the deadlock.
+        spawned_pids[spawned_count] = pid;
+        parent_close_after_fork[spawned_count] = (
+            if cur_read_fd > 2 && cur_read_fd != stdin_fd {
+                cur_read_fd
+            } else if cur_write_fd > 2 && cur_write_fd != stdout_fd {
+                cur_write_fd
+            } else {
+                -1
+            },
+            cur_write_fd > 2 && cur_write_fd != stdout_fd,
+        );
+        spawned_count += 1;
         last_pid = pid;
-        // Wait for the child to finish before starting the next segment,
-        // unless this is a background job.
-        if !p.background {
-            let mut status: i32 = 0;
-            syscalls::waitpid(pid as u64, &mut status, 0);
+    }
+
+    // Close any pipe fds the parent still holds. This is essential:
+    // without it, the last reader's `read()` will never return EOF
+    // because the parent still has the write end open.
+    for i in 0..spawned_count {
+        let (fd, _is_write) = parent_close_after_fork[i];
+        if fd > 2 {
+            syscalls::close(fd as u64);
+        }
+    }
+
+    // Wait for all spawned children in order, unless this is a
+    // background pipeline (in which case we register the last child
+    // as a job and return immediately).
+    if !p.background {
+        for i in 0..spawned_count {
+            let pid = spawned_pids[i];
+            if pid > 0 {
+                let mut status: i32 = 0;
+                syscalls::waitpid(pid as u64, &mut status, 0);
+            }
         }
     }
 

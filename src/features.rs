@@ -178,7 +178,16 @@ pub unsafe fn history_expand(line: &[u8]) -> Vec<u8> {
                 let mut j = i + 2;
                 let mut n = 0usize;
                 while j < line.len() && line[j] >= b'0' && line[j] <= b'9' {
-                    n = n * 10 + (line[j] - b'0') as usize;
+                    // Audit fix (🟢 #6): checked arithmetic — same reason
+                    // as parse_job_id. `n = n * 10 + (b - b'0')` could
+                    // overflow usize on a pathological input.
+                    n = match n
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((line[j] - b'0') as usize))
+                    {
+                        Some(v) => v,
+                        None => break,
+                    };
                     j += 1;
                 }
                 if n > 0 && j > i + 2 {
@@ -200,7 +209,14 @@ pub unsafe fn history_expand(line: &[u8]) -> Vec<u8> {
                 let mut j = i + 1;
                 let mut n = 0usize;
                 while j < line.len() && line[j] >= b'0' && line[j] <= b'9' {
-                    n = n * 10 + (line[j] - b'0') as usize;
+                    // Audit fix (🟢 #6): checked arithmetic — same as above.
+                    n = match n
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((line[j] - b'0') as usize))
+                    {
+                        Some(v) => v,
+                        None => break,
+                    };
                     j += 1;
                 }
                 if let Some(entry) = history_get(n) {
@@ -327,45 +343,39 @@ fn scan_dir_entries(dir_path: &[u8]) -> Vec<[u8; 64]> {
 
 /// Match a glob pattern against a filename. Supports `*` (any sequence),
 /// `?` (any single char), and `[...]` (character class with ranges).
+///
+/// Audit fix (🟢 #11): the previous implementation recursed on every
+/// `*` in the pattern, so a pathological input like `ls *a*a*a*a*a*a`
+/// would consume exponential stack. We now use the standard iterative
+/// two-pointer algorithm (O(n*m) time, O(1) stack): when a `*` fails
+/// to match the rest, we backtrack by advancing the name pointer by
+/// one and retrying from just after the `*`.
 pub fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
-    glob_match_helper(pattern, 0, name, 0)
-}
+    let mut pi = 0usize;
+    let mut ni = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ni = 0usize;
 
-fn glob_match_helper(pattern: &[u8], pi: usize, name: &[u8], ni: usize) -> bool {
-    let mut pi = pi;
-    let mut ni = ni;
-    while pi < pattern.len() {
-        match pattern[pi] {
-            b'*' => {
-                pi += 1;
-                if pi >= pattern.len() {
-                    return true;
-                }
-                while ni <= name.len() {
-                    if glob_match_helper(pattern, pi, name, ni) {
-                        return true;
-                    }
-                    ni += 1;
-                }
-                return false;
-            }
-            b'?' => {
-                if ni >= name.len() {
-                    return false;
-                }
-                ni += 1;
-                pi += 1;
-            }
-            b'[' => {
-                if ni >= name.len() {
-                    return false;
-                }
+    while ni < name.len() {
+        if pi < pattern.len()
+            && (pattern[pi] == b'?' || pattern[pi] == name[ni] || pattern[pi] == b'[')
+        {
+            if pattern[pi] == b'[' {
+                // Character class. Find the closing ']'.
                 let mut end = pi + 1;
                 while end < pattern.len() && pattern[end] != b']' {
                     end += 1;
                 }
                 if end >= pattern.len() {
+                    // No closing ']' — treat '[' as a literal.
                     if name[ni] != b'[' {
+                        // Try backtrack via the last '*', if any.
+                        if let Some(spi) = star_pi {
+                            pi = spi + 1;
+                            star_ni += 1;
+                            ni = star_ni;
+                            continue;
+                        }
                         return false;
                     }
                     ni += 1;
@@ -392,21 +402,40 @@ fn glob_match_helper(pattern: &[u8], pi: usize, name: &[u8], ni: usize) -> bool 
                     }
                 }
                 if !matched {
+                    if let Some(spi) = star_pi {
+                        pi = spi + 1;
+                        star_ni += 1;
+                        ni = star_ni;
+                        continue;
+                    }
                     return false;
                 }
                 ni += 1;
                 pi = end + 1;
-            }
-            c => {
-                if ni >= name.len() || name[ni] != c {
-                    return false;
-                }
+            } else {
+                // `?` or literal match.
                 ni += 1;
                 pi += 1;
             }
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(spi) = star_pi {
+            // Backtrack: consume one more char under the last '*'.
+            pi = spi + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
         }
     }
-    ni == name.len()
+
+    // Consume any trailing `*`s in the pattern.
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 // ── Minimal Vec implementation (no heap, static backing) ────────────────
