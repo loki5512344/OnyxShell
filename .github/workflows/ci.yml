@@ -1,0 +1,45 @@
+name: OnyxShell CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: loki5512344/OnyxKernel
+          path: OnyxKernel
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv64gc-unknown-none-elf
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            OnyxKernel
+
+      - name: Build
+        env:
+          ONYXKERNEL_DIR: ${{ github.workspace }}/OnyxKernel
+        run: bash build.sh
+
+      - name: Upload osh.onx
+        uses: actions/upload-artifact@v6
+        with:
+          name: osh-onx
+          path: build/osh.onx
