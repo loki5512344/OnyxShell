@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/platform-RISC--V%2064--bit-green" alt="RISC-V 64">
   <img src="https://img.shields.io/badge/language-Rust%2090%25-orange" alt="Rust 90%">
-  <img src="https://img.shields.io/badge/version-v0.2-blue" alt="v0.2">
+  <img src="https://img.shields.io/badge/version-v0.3-blue" alt="v0.3">
   <img src="https://img.shields.io/badge/target-OnyxOS-yellow" alt="OnyxOS">
   <img src="https://img.shields.io/badge/license-GPL--3.0-red" alt="GPL-3.0">
 </p>
@@ -195,7 +195,7 @@ OnyxBoot v0.4 [riscv-virtio,qemu]
 [init] launching /bin/login
 [login] no users found - auto-login as root
 [login] launching /bin/osh (root, ring 1)
-OnyxShell v0.2.0 (built-in commands)
+OnyxShell v0.3.0 (built-in commands)
 osh$ _
 ```
 
